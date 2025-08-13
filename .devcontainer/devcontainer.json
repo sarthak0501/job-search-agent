@@ -1,0 +1,9 @@
+{
+  "name": "job-search-agent",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+  "postCreateCommand": "pip install -r requirements.txt",
+  "forwardPorts": [8000]
+}

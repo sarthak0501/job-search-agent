@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+pyyaml
+apscheduler
+sqlalchemy
+sentence-transformers
+weasyprint
+watchfiles
