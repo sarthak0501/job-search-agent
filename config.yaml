@@ -1,0 +1,24 @@
+app:
+  timezone: "America/Los_Angeles"
+
+compliance:
+  obey_robots_txt: true
+  user_agent: "job-search-agent/1.0 (+https://example.com)"
+  allow_domains: []         # empty = allow all except denied
+  deny_domains: ["linkedin.com", "www.linkedin.com"]
+  rate_limits:
+    default_per_minute: 30
+    overrides:
+      greenhouse.io: 60
+      boards.greenhouse.io: 60
+      api.lever.co: 60
+
+sources:
+  - plugin: "greenhouse"    # placeholder; wired in Step 3
+    enabled: false
+  - plugin: "lever"         # placeholder; wired in Step 3
+    enabled: false
+
+scoring:
+  base: "hybrid_v1"
+  threshold: 70
