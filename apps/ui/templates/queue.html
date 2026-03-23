@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="queue-header">
+  <h2>
+    {% if current_status == "new" %}Review Queue
+    {% elif current_status == "approved" %}Approved
+    {% elif current_status == "applied" %}Applied
+    {% else %}{{ current_status | capitalize }}
+    {% endif %}
+    <span class="badge">{{ jobs | length }}</span>
+  </h2>
+  <div class="filter-tabs">
+    <a href="/queue?status=new"      class="tab {% if current_status=='new'      %}active{% endif %}">New</a>
+    <a href="/queue?status=approved" class="tab {% if current_status=='approved' %}active{% endif %}">Approved</a>
+    <a href="/queue?status=applied"  class="tab {% if current_status=='applied'  %}active{% endif %}">Applied</a>
+    <a href="/queue?status=rejected" class="tab {% if current_status=='rejected' %}active{% endif %}">Rejected</a>
+  </div>
+</div>
+
+{% if jobs %}
+  <div class="job-list">
+    {% for job in jobs %}
+    <div class="job-card" id="card-{{ job.id }}">
+      <div class="job-main">
+        <div class="job-score {% if job.score >= 85 %}score-high{% elif job.score >= 70 %}score-mid{% else %}score-low{% endif %}">
+          {{ job.score }}
+        </div>
+        <div class="job-info">
+          <div class="job-title">
+            <a href="{{ job.url }}" target="_blank" rel="noopener">{{ job.title }}</a>
+          </div>
+          <div class="job-meta">{{ job.company }} &middot; {{ job.location or "Remote / Unspecified" }} &middot; {{ job.source }}</div>
+        </div>
+      </div>
+      {% if job.status == "new" %}
+      <div class="job-actions">
+        <button class="btn btn-sm btn-approve" onclick="action({{ job.id }}, 'approve')">Approve</button>
+        <button class="btn btn-sm btn-apply"   onclick="action({{ job.id }}, 'apply')">Apply</button>
+        <button class="btn btn-sm btn-reject"  onclick="action({{ job.id }}, 'reject')">Reject</button>
+      </div>
+      {% elif job.status == "approved" %}
+      <div class="job-actions">
+        <button class="btn btn-sm btn-apply"  onclick="action({{ job.id }}, 'apply')">Apply</button>
+        <button class="btn btn-sm btn-reject" onclick="action({{ job.id }}, 'reject')">Reject</button>
+      </div>
+      {% else %}
+      <div class="job-status-badge status-{{ job.status }}">{{ job.status }}</div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <p class="empty-msg">No jobs in this bucket yet.</p>
+{% endif %}
+
+<script>
+async function action(id, verb) {
+  const r = await fetch(`/api/jobs/${id}/${verb}`, {method: 'POST'});
+  if (r.ok) {
+    const card = document.getElementById(`card-${id}`);
+    card.classList.add('fade-out');
+    setTimeout(() => card.remove(), 300);
+  }
+}
+</script>
+{% endblock %}

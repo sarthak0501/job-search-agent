@@ -1,5 +1,41 @@
 {% extends "base.html" %}
 {% block content %}
-<h2>Welcome, Sarthak</h2>
-<p>Web-based MVP scaffold is live. Next: sources, scoring, tailoring, review queue, allow-listed auto-apply.</p>
+<h2>Dashboard</h2>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <span class="stat-num">{{ stats.total }}</span>
+    <span class="stat-label">Total Jobs</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-num">{{ stats.new }}</span>
+    <span class="stat-label">Pending Review</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-num">{{ stats.approved }}</span>
+    <span class="stat-label">Approved</span>
+  </div>
+  <div class="stat-card">
+    <span class="stat-num">{{ stats.applied }}</span>
+    <span class="stat-label">Applied</span>
+  </div>
+</div>
+
+<div class="actions">
+  <a class="btn" href="/queue?status=new">Review Queue</a>
+  <a class="btn btn-secondary" href="/queue?status=approved">Approved</a>
+  <a class="btn btn-secondary" href="/queue?status=applied">Applied</a>
+  <button class="btn btn-outline" onclick="triggerFetch()">Fetch Jobs Now</button>
+</div>
+
+<div id="fetch-msg" style="margin-top:12px;color:#555;"></div>
+
+<script>
+async function triggerFetch() {
+  document.getElementById('fetch-msg').textContent = 'Fetching…';
+  const r = await fetch('/api/fetch', {method:'POST'});
+  const d = await r.json();
+  document.getElementById('fetch-msg').textContent = d.message;
+}
+</script>
 {% endblock %}
