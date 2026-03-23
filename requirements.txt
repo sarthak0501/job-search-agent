@@ -5,6 +5,7 @@ python-multipart
 pyyaml
 apscheduler
 sqlalchemy
+httpx
 sentence-transformers
 weasyprint
 watchfiles

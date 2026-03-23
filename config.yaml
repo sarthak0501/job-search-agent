@@ -1,6 +1,32 @@
 app:
   timezone: "America/Los_Angeles"
 
+# ── User profile ──────────────────────────────────────────────────────────────
+# Scoring compares job postings against this profile.
+# Edit target_titles, skills, and locations to match your background.
+profile:
+  target_titles:
+    - "software engineer"
+    - "backend engineer"
+    - "full stack engineer"
+    - "software developer"
+  skills:
+    - python
+    - fastapi
+    - sql
+    - postgresql
+    - rest api
+    - docker
+    - kubernetes
+    - aws
+    - git
+    - machine learning
+  locations:
+    - "san francisco"
+    - "new york"
+    - "remote"
+
+# ── Compliance ────────────────────────────────────────────────────────────────
 compliance:
   obey_robots_txt: true
   user_agent: "job-search-agent/1.0 (+https://example.com)"
@@ -9,16 +35,30 @@ compliance:
   rate_limits:
     default_per_minute: 30
     overrides:
-      greenhouse.io: 60
-      boards.greenhouse.io: 60
+      boards-api.greenhouse.io: 60
       api.lever.co: 60
 
+# ── Sources ───────────────────────────────────────────────────────────────────
+# Add company slugs under each plugin.
+# Greenhouse slug = the subdomain on their job board (e.g. greenhouse.io/reddit)
+# Lever slug      = company name used in lever.co/jobs/<slug>
 sources:
-  - plugin: "greenhouse"    # placeholder; wired in Step 3
-    enabled: false
-  - plugin: "lever"         # placeholder; wired in Step 3
-    enabled: false
+  - plugin: "greenhouse"
+    enabled: true
+    companies:
+      - "reddit"
+      - "airbnb"
+      - "stripe"
+      - "notion"
 
+  - plugin: "lever"
+    enabled: true
+    companies:
+      - "netflix"
+      - "figma"
+      - "discord"
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
 scoring:
   base: "hybrid_v1"
-  threshold: 70
+  threshold: 60            # minimum score (0-100) to store a job
