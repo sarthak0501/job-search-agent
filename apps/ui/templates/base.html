@@ -10,7 +10,12 @@
   <h1>Job Search Agent</h1>
   <nav>
     <a href="/">Home</a>
-    <a href="/health">Health</a>
+    <a href="/queue">Queue</a>
+    {% if has_profile() %}
+    <a href="/setup">Edit Profile</a>
+    {% else %}
+    <a href="/setup" style="color:#ef4444;font-weight:700;">⚠ Setup Profile</a>
+    {% endif %}
   </nav>
 </header>
 <main>

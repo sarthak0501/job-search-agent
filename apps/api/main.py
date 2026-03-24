@@ -4,8 +4,8 @@ import pathlib
 from contextlib import asynccontextmanager
 from typing import Generator
 
-from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
@@ -14,13 +14,14 @@ from core.models import Job, get_engine, init_db, make_session_factory
 from core.scheduler import start_scheduler, stop_scheduler
 from core.fetcher import fetch_and_store
 from core.applier import apply_to_job
+from core.profile_store import profile_exists, load_profile, save_profile
 
-# ── paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR      = pathlib.Path(__file__).resolve().parents[1]   # apps/
+# ── paths ──────────────────────────────────────────────────────────────────────
+BASE_DIR      = pathlib.Path(__file__).resolve().parents[1]
 STATIC_DIR    = BASE_DIR / "ui" / "static"
 TEMPLATES_DIR = BASE_DIR / "ui" / "templates"
 
-# ── db setup ──────────────────────────────────────────────────────────────────
+# ── db ─────────────────────────────────────────────────────────────────────────
 _engine         = get_engine()
 init_db(_engine)
 _SessionFactory = make_session_factory(_engine)
@@ -34,23 +35,109 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-# ── lifespan ──────────────────────────────────────────────────────────────────
+# ── lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.has_profile = profile_exists()
     start_scheduler(interval_hours=1)
     yield
     stop_scheduler()
 
 
-# ── app ───────────────────────────────────────────────────────────────────────
+# ── app ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Job Search Agent", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
+# Expose has_profile as a Jinja2 global so base.html can read it without
+# needing it passed explicitly in every TemplateResponse context.
+templates.env.globals["has_profile"] = lambda: app.state.has_profile
 
-# ── pages ─────────────────────────────────────────────────────────────────────
+
+# ── setup guard ────────────────────────────────────────────────────────────────
+def _require_profile() -> RedirectResponse | None:
+    if not app.state.has_profile:
+        return RedirectResponse("/setup", status_code=302)
+    return None
+
+
+# ── setup routes ───────────────────────────────────────────────────────────────
+@app.get("/setup", response_class=HTMLResponse)
+def setup_get(request: Request):
+    existing = load_profile() or {}
+    return templates.TemplateResponse(request, "setup.html",
+                                      {"profile": existing, "error": None})
+
+
+@app.post("/setup")
+def setup_post(
+    request:              Request,
+    first_name:           str = Form(...),
+    last_name:            str = Form(...),
+    email:                str = Form(...),
+    phone:                str = Form(...),
+    phone_country_code:   str = Form(default="+1"),
+    address:              str = Form(default=""),
+    city:                 str = Form(default=""),
+    state:                str = Form(default=""),
+    zip:                  str = Form(default=""),
+    country:              str = Form(default="United States"),
+    location:             str = Form(default=""),
+    current_company:      str = Form(default=""),
+    current_title:        str = Form(default=""),
+    years_experience:     str = Form(default=""),
+    linkedin:             str = Form(default=""),
+    salary_min:           str = Form(default=""),
+    salary_max:           str = Form(default=""),
+    salary_range:         str = Form(default=""),
+    work_authorized:      str = Form(default="Yes"),
+    requires_sponsorship: str = Form(default="No"),
+    resume_path:          str = Form(...),
+    gender:               str = Form(default=""),
+    gender_eeoc:          str = Form(default=""),
+    transgender:          str = Form(default="No"),
+    orientation:          str = Form(default=""),
+    disability:           str = Form(default="No"),
+    veteran:              str = Form(default="I am not a protected veteran"),
+    referral_source:      str = Form(default="Job board"),
+):
+    profile_data = {
+        "first_name": first_name, "last_name": last_name,
+        "email": email, "phone": phone,
+        "phone_country_code": phone_country_code,
+        "address": address, "city": city, "state": state,
+        "zip": zip, "country": country, "location": location,
+        "current_company": current_company, "current_title": current_title,
+        "years_experience": years_experience, "linkedin": linkedin,
+        "salary_min": salary_min, "salary_max": salary_max,
+        "salary_range": salary_range,
+        "work_authorized": work_authorized,
+        "requires_sponsorship": requires_sponsorship,
+        "resume_path": resume_path,
+        "gender": gender, "gender_eeoc": gender_eeoc,
+        "transgender": transgender, "orientation": orientation,
+        "disability": disability, "veteran": veteran,
+        "referral_source": referral_source,
+    }
+
+    if not pathlib.Path(resume_path).exists():
+        return templates.TemplateResponse(
+            request, "setup.html",
+            {"profile": profile_data,
+             "error": f"Resume file not found at: {resume_path}"},
+            status_code=422,
+        )
+
+    save_profile(profile_data)
+    app.state.has_profile = True
+    return RedirectResponse("/queue", status_code=303)
+
+
+# ── pages ──────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, db: Session = Depends(get_db)):
+    if redir := _require_profile():
+        return redir
     stats = {
         "total":    db.query(Job).count(),
         "new":      db.query(Job).filter_by(status="new").count(),
@@ -61,11 +148,10 @@ def index(request: Request, db: Session = Depends(get_db)):
 
 
 @app.get("/queue", response_class=HTMLResponse)
-def queue_page(
-    request: Request,
-    status: str = "new",
-    db: Session = Depends(get_db),
-):
+def queue_page(request: Request, status: str = "new",
+               db: Session = Depends(get_db)):
+    if redir := _require_profile():
+        return redir
     jobs = (
         db.query(Job)
         .filter_by(status=status)
@@ -77,24 +163,20 @@ def queue_page(
     )
 
 
-# ── health ────────────────────────────────────────────────────────────────────
+# ── health ─────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "has_profile": app.state.has_profile}
 
 
-# ── REST API ──────────────────────────────────────────────────────────────────
+# ── REST API ───────────────────────────────────────────────────────────────────
 @app.get("/api/jobs")
-def list_jobs(
-    status: str | None = None,
-    limit: int = 50,
-    db: Session = Depends(get_db),
-):
+def list_jobs(status: str | None = None, limit: int = 50,
+              db: Session = Depends(get_db)):
     q = db.query(Job)
     if status:
         q = q.filter_by(status=status)
-    jobs = q.order_by(Job.score.desc()).limit(limit).all()
-    return [j.to_dict() for j in jobs]
+    return [j.to_dict() for j in q.order_by(Job.score.desc()).limit(limit).all()]
 
 
 @app.get("/api/jobs/{job_id}")
@@ -128,47 +210,45 @@ def reject_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/apply")
-def apply_job(job_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def apply_job(job_id: int, background_tasks: BackgroundTasks,
+              db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status not in ("new", "approved"):
         raise HTTPException(400, f"Cannot apply to a job with status '{job.status}'")
 
-    # Mark as applying immediately so UI reflects it
     job.status = "applying"
     db.commit()
 
-    def _run_apply(job_id: int):
-        # Fresh DB session for background thread
-        bg_session = _SessionFactory()
+    def _run(job_id: int):
+        bg = _SessionFactory()
         try:
-            bg_job = bg_session.get(Job, job_id)
+            bg_job = bg.get(Job, job_id)
             result = apply_to_job(bg_job)
+            bg_job.status = "applied" if result.get("success") else "approved"
             if result.get("success"):
-                bg_job.status     = "applied"
                 bg_job.applied_at = datetime.datetime.utcnow()
             else:
-                bg_job.status = "approved"
-                print(f"[applier] job {job_id} failed: {result.get('error', 'unknown')}")
-            bg_session.commit()
+                print(f"[apply] job {job_id} failed: {result.get('error','unknown')}")
+            bg.commit()
         except Exception as exc:
-            print(f"[applier] job {job_id} exception: {exc}")
+            print(f"[apply] job {job_id} exception: {exc}")
             try:
-                bg_job = bg_session.get(Job, job_id)
+                bg_job = bg.get(Job, job_id)
                 bg_job.status = "approved"
-                bg_session.commit()
+                bg.commit()
             except Exception:
                 pass
         finally:
-            bg_session.close()
+            bg.close()
 
-    background_tasks.add_task(_run_apply, job_id)
-    return {"id": job_id, "status": "applying", "message": "Browser opened — application in progress"}
+    background_tasks.add_task(_run, job_id)
+    return {"id": job_id, "status": "applying",
+            "message": "Browser opened — AI is filling the form"}
 
 
 @app.post("/api/fetch")
 def trigger_fetch(background_tasks: BackgroundTasks):
-    """Manually trigger a job-fetch cycle."""
     background_tasks.add_task(fetch_and_store)
     return {"message": "Fetch started in background"}
