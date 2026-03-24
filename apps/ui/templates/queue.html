@@ -17,6 +17,8 @@
   </div>
 </div>
 
+<div id="queue-msg" class="queue-msg" hidden></div>
+
 {% if jobs %}
   <div class="job-list">
     {% for job in jobs %}
@@ -30,6 +32,9 @@
             <a href="{{ job.url }}" target="_blank" rel="noopener">{{ job.title }}</a>
           </div>
           <div class="job-meta">{{ job.company }} &middot; {{ job.location or "Remote / Unspecified" }} &middot; {{ job.source }}</div>
+          {% if job.last_error %}
+          <div class="job-error">{{ job.last_error }}</div>
+          {% endif %}
         </div>
       </div>
       {% if job.status == "new" %}
@@ -56,13 +61,29 @@
 {% endif %}
 
 <script>
+function showQueueMessage(text, kind = 'info') {
+  const box = document.getElementById('queue-msg');
+  box.hidden = false;
+  box.textContent = text;
+  box.className = `queue-msg ${kind}`;
+}
+
 async function action(id, verb) {
   const r = await fetch(`/api/jobs/${id}/${verb}`, {method: 'POST'});
-  if (r.ok) {
-    const card = document.getElementById(`card-${id}`);
-    card.classList.add('fade-out');
-    setTimeout(() => card.remove(), 300);
+  const data = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    showQueueMessage(data.detail || data.message || 'Request failed.', 'error');
+    return;
   }
+
+  if (verb === 'apply') {
+    showQueueMessage(data.message || 'Application started.', 'success');
+  }
+
+  const card = document.getElementById(`card-${id}`);
+  card.classList.add('fade-out');
+  setTimeout(() => card.remove(), 300);
 }
 </script>
 {% endblock %}

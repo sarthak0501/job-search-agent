@@ -16,7 +16,7 @@ _SOURCE_MAP = {
 }
 
 
-def fetch_and_store(config_path: str = "config.yaml") -> dict:
+def fetch_and_store(config_path: str | None = None) -> dict:
     cfg    = load_config(config_path)
     gate   = ComplianceGate(cfg.compliance)
     engine = get_engine()

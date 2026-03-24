@@ -2,19 +2,19 @@ from __future__ import annotations
 """
 ai_filler.py – Claude-powered form-fill loop (sync Playwright API).
 
-Uses sync_playwright so it works cleanly in FastAPI background threads
-without asyncio event-loop conflicts.
+Uses the local `claude` CLI (Claude Code) as the AI backend — no API key
+required. The user just needs a Claude Code terminal open.
 """
-import base64
 import json
 import os
+import subprocess
 import tempfile
 import time
 
-import anthropic
 from playwright.sync_api import Page, Frame, TimeoutError as PWTimeout
 
 MAX_ATTEMPTS = 5
+CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
 
 
 # ── DOM extraction ─────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ def _extract_form_fields(frame: Frame) -> list[dict]:
         const fields = [];
         const seen = new Set();
         const inputs = document.querySelectorAll(
-            'input:not([type=hidden]):not([type=submit]):not([type=button]),' +
+            'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]),' +
             'textarea, select'
         );
         inputs.forEach(el => {
@@ -32,6 +32,10 @@ def _extract_form_fields(frame: Frame) -> list[dict]:
             const key  = id || name;
             if (!key || seen.has(key)) return;
             seen.add(key);
+
+            // Skip elements with zero dimensions (hidden/collapsed)
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) return;
 
             let label = '';
             if (id) {
@@ -65,11 +69,6 @@ def _extract_form_fields(frame: Frame) -> list[dict]:
     }""")
 
 
-def _screenshot_b64(page: Page) -> str:
-    data = page.screenshot(type="jpeg", quality=55, full_page=False)
-    return base64.standard_b64encode(data).decode()
-
-
 # ── Claude prompt ──────────────────────────────────────────────────────────────
 def _build_prompt(fields: list[dict], profile: dict,
                   prior_errors: list[str], attempt: int) -> str:
@@ -101,12 +100,16 @@ Action types:
 
 Rules:
 - Always end with click_submit.
+- Use the field's id when present. If id is blank, put the field name in the id slot.
 - Resume upload (id=resume): use profile.resume_path.
 - Cover letter upload (id=cover_letter): use profile._cover_letter_path if present, else skip.
 - Phone country-code combobox (id=country): use combobox action with value "United States".
 - Phone (id=phone): fill with raw digits from profile.phone (no dashes or spaces).
-- For EEOC fields (gender, race, disability, veteran, orientation, transgender):
-  use profile value if it matches an option, otherwise pick "decline / prefer not to answer".
+- For EEOC fields (gender, race, ethnicity, disability, veteran, orientation, transgender,
+  sexual orientation): use the profile value if it matches an option. If no match, pick
+  the option containing "decline", "prefer not", "choose not", or "I don't wish".
+  If none of those exist, pick the LAST option in the list (usually the decline option).
+  These fields are often required — always pick something.
 - Salary: use salary_min, salary_max, or salary_range as the label suggests.
 - Skip LinkedIn if profile.linkedin is empty.
 - For open-ended textarea questions, write a brief professional answer from the applicant's background.
@@ -116,63 +119,101 @@ Rules:
 
 
 # ── Action executor ────────────────────────────────────────────────────────────
-def _execute_actions(frame: Frame, actions: list[dict]) -> None:
+def _selector_candidates(action: dict) -> list[str]:
+    values = []
+    for key in ("id", "name"):
+        value = str(action.get(key, "")).strip()
+        if value and value not in values:
+            values.append(value)
+
+    selectors: list[str] = []
+    for value in values:
+        quoted = json.dumps(value)
+        selectors.append(f"[id={quoted}]")
+        selectors.append(f"[name={quoted}]")
+    return selectors
+
+
+def _wait_for_action_target(frame: Frame, action: dict, timeout: int = 4000):
+    last_exc = None
+    for selector in _selector_candidates(action):
+        try:
+            return frame.wait_for_selector(selector, timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    raise ValueError(f"No selector candidates found for action: {action}")
+
+
+def _execute_actions(page: Page, frame: Frame, actions: list[dict]) -> None:
     for action in actions:
         atype = action.get("type")
-        aid   = str(action.get("id", ""))
         value = str(action.get("value", ""))
-        sel   = f'[id="{aid}"]' if aid else ""
 
         try:
             if atype == "fill":
-                el = frame.wait_for_selector(sel, timeout=4000)
+                el = _wait_for_action_target(frame, action)
                 el.fill(value)
 
             elif atype == "select":
-                el = frame.wait_for_selector(sel, timeout=4000)
+                el = _wait_for_action_target(frame, action)
                 try:
                     el.select_option(label=value)
                 except Exception:
                     el.select_option(value=value)
 
             elif atype == "combobox":
-                inp = frame.wait_for_selector(sel, timeout=4000)
+                # Close any open dropdown first
+                page.keyboard.press("Escape")
+                time.sleep(0.2)
+                inp = _wait_for_action_target(frame, action)
                 inp.click()
-                time.sleep(0.35)
-                inp.fill(value)
-                time.sleep(0.6)
-                options = frame.query_selector_all('[role="option"]')
-                matched = False
-                for opt in options:
-                    try:
-                        if not opt.is_visible():
-                            continue
-                        text = opt.inner_text().strip()
-                        if value.lower() in text.lower():
-                            opt.click()
-                            matched = True
-                            break
-                    except Exception:
-                        continue
-                if not matched:
-                    for opt in reversed(options):
+                time.sleep(0.8)
+
+                def _pick_option(opts, val):
+                    """Return True if a matching option was found and clicked."""
+                    for opt in opts:
                         try:
-                            if opt.is_visible():
+                            text = opt.inner_text().strip()
+                            if not text:
+                                continue
+                            if val.lower() in text.lower() or text.lower() in val.lower():
                                 opt.click()
-                                break
+                                return True
                         except Exception:
                             continue
+                    return False
+
+                # Strategy 1: scan full list (no typing) — works for fixed-option dropdowns
+                # Don't filter by is_visible() so we can find options scrolled out of view
+                options = frame.query_selector_all('[role="option"]')
+                matched = _pick_option(options, value)
+
+                # Strategy 2: type to filter — works for searchable dropdowns
+                if not matched:
+                    inp.fill(value)
+                    time.sleep(0.8)
+                    options = frame.query_selector_all('[role="option"]')
+                    matched = _pick_option(options, value)
+
+                # Fallback: pick first visible option (accept anything over leaving it blank)
+                if not matched:
+                    all_opts = [o for o in frame.query_selector_all('[role="option"]') if o.is_visible()]
+                    if all_opts:
+                        all_opts[0].click()
+
                 time.sleep(0.3)
 
             elif atype == "upload":
                 if os.path.exists(value):
-                    el = frame.wait_for_selector(sel, timeout=4000)
+                    el = _wait_for_action_target(frame, action)
                     el.set_input_files(value)
                 else:
                     print(f"[ai_filler] upload skipped — file not found: {value}")
 
             elif atype == "check":
-                el = frame.wait_for_selector(sel, timeout=4000)
+                el = _wait_for_action_target(frame, action)
                 el.check()
 
             elif atype == "click_submit":
@@ -198,29 +239,53 @@ def _execute_actions(frame: Frame, actions: list[dict]) -> None:
 
 
 # ── Outcome detection ──────────────────────────────────────────────────────────
-def _detect_outcome(frame: Frame) -> tuple[str, list[str]]:
-    content = frame.content().lower()
-    if any(w in content for w in [
+def _detect_outcome(page: Page, frame: Frame) -> tuple[str, list[str]]:
+    contents = []
+    seen_urls = set()
+
+    for scope in (frame, page.main_frame):
+        try:
+            scope_url = getattr(scope, "url", "")
+            if scope_url in seen_urls:
+                continue
+            seen_urls.add(scope_url)
+            contents.append(scope.content().lower())
+        except Exception:
+            continue
+
+    current_urls = " ".join(
+        part.lower()
+        for part in [page.url, getattr(frame, "url", "")]
+        if part
+    )
+
+    haystack = "\n".join(contents + [current_urls])
+    if any(w in haystack for w in [
         "thank you", "application received", "successfully submitted",
         "we'll be in touch", "application submitted", "you've applied",
-        "your application has been",
+        "your application has been", "thank_you",
     ]):
         return "success", []
 
-    error_els = frame.query_selector_all(
-        '[class*="error"]:not([class*="error-boundary"]),'
-        '[class*="invalid"],[aria-invalid="true"],'
-        '.field_with_errors,[class*="validation"]'
-    )
     errors = []
-    for el in error_els:
+    for scope in (frame, page.main_frame):
         try:
-            if el.is_visible():
-                txt = el.inner_text().strip()
-                if txt and len(txt) < 300:
-                    errors.append(txt)
+            error_els = scope.query_selector_all(
+                '[class*="error"]:not([class*="error-boundary"]),'
+                '[class*="invalid"],[aria-invalid="true"],'
+                '.field_with_errors,[class*="validation"]'
+            )
         except Exception:
-            pass
+            continue
+
+        for el in error_els:
+            try:
+                if el.is_visible():
+                    txt = el.inner_text().strip()
+                    if txt and len(txt) < 300:
+                        errors.append(txt)
+            except Exception:
+                pass
 
     if errors:
         return "errors", list(dict.fromkeys(errors))
@@ -228,16 +293,27 @@ def _detect_outcome(frame: Frame) -> tuple[str, list[str]]:
     return "unknown", []
 
 
+def _call_claude_cli(prompt: str) -> str:
+    """Call the local claude CLI and return its output."""
+    result = subprocess.run(
+        [CLAUDE_BIN, "-p", prompt],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude CLI error: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
 # ── Main entry (sync) ──────────────────────────────────────────────────────────
 def ai_fill_form(page: Page, frame: Frame,
                  profile: dict, cover_letter: str) -> bool:
-    """Claude-powered retry loop. Returns True if form was submitted."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("[ai_filler] ANTHROPIC_API_KEY not set — skipping AI fill")
+    """Claude-powered retry loop using local claude CLI. Returns True if submitted."""
+    if not os.path.exists(CLAUDE_BIN):
+        print(f"[ai_filler] claude CLI not found at {CLAUDE_BIN}")
         return False
 
-    client = anthropic.Anthropic(api_key=api_key)
     prior_errors: list[str] = []
 
     cl_tmp = None
@@ -256,27 +332,12 @@ def ai_fill_form(page: Page, frame: Frame,
                 print("[ai_filler] no fields found — giving up")
                 return False
 
-            screenshot_b64 = _screenshot_b64(page)
             prompt = _build_prompt(fields, profile, prior_errors, attempt)
 
             try:
-                msg = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=2048,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": screenshot_b64,
-                            }},
-                            {"type": "text", "text": prompt},
-                        ],
-                    }],
-                )
-                raw = msg.content[0].text.strip()
-                if raw.startswith("```"):
+                raw = _call_claude_cli(prompt)
+                # Strip markdown fences if Claude wraps output
+                if "```" in raw:
                     raw = "\n".join(
                         l for l in raw.splitlines()
                         if not l.strip().startswith("```")
@@ -287,9 +348,9 @@ def ai_fill_form(page: Page, frame: Frame,
                 break
 
             print(f"[ai_filler] executing {len(actions)} actions")
-            _execute_actions(frame, actions)
+            _execute_actions(page, frame, actions)
 
-            outcome, errors = _detect_outcome(frame)
+            outcome, errors = _detect_outcome(page, frame)
             print(f"[ai_filler] outcome={outcome} errors={errors}")
 
             if outcome == "success":

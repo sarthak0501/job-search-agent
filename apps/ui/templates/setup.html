@@ -143,9 +143,15 @@
       <input name="veteran" value="{{ profile.veteran or 'I am not a protected veteran' }}">
     </div>
   </div>
-  <div class="form-group" style="max-width:300px">
-    <label>How did you hear about the job?</label>
-    <input name="referral_source" value="{{ profile.referral_source or 'Job board' }}">
+  <div class="form-row">
+    <div class="form-group">
+      <label>Ethnicity / Race (for EEOC forms)</label>
+      <input name="ethnicity" value="{{ profile.ethnicity or '' }}" placeholder="e.g. Asian">
+    </div>
+    <div class="form-group">
+      <label>How did you hear about the job?</label>
+      <input name="referral_source" value="{{ profile.referral_source or 'Job board' }}">
+    </div>
   </div>
 
   <div style="margin-top:28px;">

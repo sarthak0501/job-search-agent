@@ -18,7 +18,8 @@ class Job(Base):
     url         = Column(String, default="")
     description = Column(Text,   default="")
     score       = Column(Float,  default=0.0)
-    status      = Column(String, default="new")    # new | approved | rejected | applied
+    status      = Column(String, default="new")    # new | approved | rejected | applying | applied
+    last_error  = Column(Text,   default="")
     fetched_at  = Column(DateTime, default=datetime.datetime.utcnow)
     applied_at  = Column(DateTime, nullable=True)
 
@@ -33,6 +34,7 @@ class Job(Base):
             "url":         self.url,
             "score":       self.score,
             "status":      self.status,
+            "last_error":  self.last_error or "",
             "fetched_at":  self.fetched_at.isoformat() if self.fetched_at else None,
             "applied_at":  self.applied_at.isoformat() if self.applied_at else None,
         }
@@ -48,6 +50,13 @@ def get_engine(db_url: str | None = None):
 
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        columns = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(jobs)")
+        }
+        if "last_error" not in columns:
+            conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN last_error TEXT")
 
 
 def make_session_factory(engine):

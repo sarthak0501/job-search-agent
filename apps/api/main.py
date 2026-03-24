@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from core.models import Job, get_engine, init_db, make_session_factory
 from core.scheduler import start_scheduler, stop_scheduler
 from core.fetcher import fetch_and_store
-from core.applier import apply_to_job
+from core.applier import apply_to_job, get_apply_readiness
 from core.profile_store import profile_exists, load_profile, save_profile
 
 # ── paths ──────────────────────────────────────────────────────────────────────
@@ -100,6 +100,7 @@ def setup_post(
     disability:           str = Form(default="No"),
     veteran:              str = Form(default="I am not a protected veteran"),
     referral_source:      str = Form(default="Job board"),
+    ethnicity:            str = Form(default=""),
 ):
     profile_data = {
         "first_name": first_name, "last_name": last_name,
@@ -117,7 +118,7 @@ def setup_post(
         "gender": gender, "gender_eeoc": gender_eeoc,
         "transgender": transgender, "orientation": orientation,
         "disability": disability, "veteran": veteran,
-        "referral_source": referral_source,
+        "ethnicity": ethnicity, "referral_source": referral_source,
     }
 
     if not pathlib.Path(resume_path).exists():
@@ -169,6 +170,11 @@ def health():
     return {"status": "ok", "has_profile": app.state.has_profile}
 
 
+@app.get("/api/apply-readiness")
+def apply_readiness():
+    return get_apply_readiness(check_browser=False)
+
+
 # ── REST API ───────────────────────────────────────────────────────────────────
 @app.get("/api/jobs")
 def list_jobs(status: str | None = None, limit: int = 50,
@@ -218,7 +224,14 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
     if job.status not in ("new", "approved"):
         raise HTTPException(400, f"Cannot apply to a job with status '{job.status}'")
 
+    readiness = get_apply_readiness(check_browser=False)
+    if not readiness["ready"]:
+        job.last_error = readiness["error"]
+        db.commit()
+        raise HTTPException(400, readiness["error"])
+
     job.status = "applying"
+    job.last_error = ""
     db.commit()
 
     def _run(job_id: int):
@@ -229,7 +242,9 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
             bg_job.status = "applied" if result.get("success") else "approved"
             if result.get("success"):
                 bg_job.applied_at = datetime.datetime.utcnow()
+                bg_job.last_error = ""
             else:
+                bg_job.last_error = result.get("error", "Unknown apply error")
                 print(f"[apply] job {job_id} failed: {result.get('error','unknown')}")
             bg.commit()
         except Exception as exc:
@@ -237,6 +252,7 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
             try:
                 bg_job = bg.get(Job, job_id)
                 bg_job.status = "approved"
+                bg_job.last_error = str(exc)
                 bg.commit()
             except Exception:
                 pass

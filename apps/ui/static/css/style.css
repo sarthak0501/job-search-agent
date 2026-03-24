@@ -57,6 +57,7 @@ footer { text-align: center; padding: 20px; color: #999; font-size: 12px; }
 .job-title a { color: #1a1a1a; text-decoration: none; }
 .job-title a:hover { color: #0070f3; }
 .job-meta { font-size: 13px; color: #777; margin-top: 2px; }
+.job-error { font-size: 12px; color: #b45309; margin-top: 6px; }
 
 .job-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .job-status-badge { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; text-transform: uppercase; letter-spacing: .05em; }
@@ -64,5 +65,10 @@ footer { text-align: center; padding: 20px; color: #999; font-size: 12px; }
 .status-applying { background: #fef9c3; color: #854d0e; }
 .status-rejected { background: #fee2e2; color: #dc2626; }
 .status-approved { background: #dcfce7; color: #16a34a; }
+
+.queue-msg { margin-bottom: 14px; padding: 10px 12px; border-radius: 8px; font-size: 14px; }
+.queue-msg.info { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+.queue-msg.success { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+.queue-msg.error { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
 
 .empty-msg { color: #888; font-size: 15px; margin-top: 32px; text-align: center; }
