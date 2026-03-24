@@ -56,7 +56,7 @@ def index(request: Request, db: Session = Depends(get_db)):
         "approved": db.query(Job).filter_by(status="approved").count(),
         "applied":  db.query(Job).filter_by(status="applied").count(),
     }
-    return templates.TemplateResponse("index.html", {"request": request, "stats": stats})
+    return templates.TemplateResponse(request, "index.html", {"stats": stats})
 
 
 @app.get("/queue", response_class=HTMLResponse)
@@ -72,8 +72,7 @@ def queue_page(
         .all()
     )
     return templates.TemplateResponse(
-        "queue.html",
-        {"request": request, "jobs": jobs, "current_status": status},
+        request, "queue.html", {"jobs": jobs, "current_status": status}
     )
 
 
