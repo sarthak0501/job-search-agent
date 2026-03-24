@@ -1,38 +1,28 @@
 from __future__ import annotations
 """
-applier.py – automated job application via Playwright.
-Supports Greenhouse-hosted forms (Reddit, Airbnb, Stripe, Databricks, Lyft, etc.)
+applier.py – automated Greenhouse job application via Playwright.
+
+Works for:
+  - Direct Greenhouse boards  (job-boards.greenhouse.io / boards.greenhouse.io)
+  - Embedded Greenhouse forms  (careers.airbnb.com, stripe.com, etc.)
+  - Lever boards               (api.lever.co)
 """
 import asyncio
 import os
 import tempfile
-from pathlib import Path
 
 import anthropic
-from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, Frame, Page, TimeoutError as PWTimeout
 
-# ── Applicant profile ──────────────────────────────────────────────────────────
-PROFILE = {
-    "first_name":           "Sarthak",
-    "last_name":            "Bichhawa",
-    "email":                "sarthaksgsits@gmail.com",
-    "phone":                "3128383536",
-    "location":             "Redmond, WA",
-    "current_company":      "Microsoft",
-    "years_experience":     "8",
-    "work_authorized":      "Yes",   # H1-B — authorized to work in US
-    "requires_sponsorship": "Yes",   # H1-B — needs sponsorship
-    "resume_path":          str(Path.home() / "Downloads" / "BichhawaSarthakResume_2026.pdf"),
-}
+from core.profile import PROFILE
 
 RESUME_SUMMARY = """
 Senior Data Scientist (8+ years) at Microsoft building production ML systems for
-reliability, attribution, and customer analytics. Key work: adaptive stress-testing
+reliability, attribution, and customer analytics. Key projects: adaptive stress-testing
 for Azure Storage (prevented 10+ Sev1/Sev2 incidents), multi-touch partner attribution
-(+10% MoM attributed revenue), LLM-powered customer health agent (50% reduction in
-aging CRIs). Previously at Walmart Labs (+7% revenue lift via planogram optimization)
-and Integral Ad Science (PySpark NLP, ~1M URLs/day). Skills: Python, SQL, PySpark,
-Azure, ML, statistical modeling, NLP, LLM agents, experiment design.
+(+10% MoM revenue), LLM-powered customer health agent (50% reduction in aging CRIs).
+Walmart Labs: planogram optimisation (+7% revenue, led 4 DS). Skills: Python, SQL,
+PySpark, Azure, ML/statistical modelling, NLP, LLM agents, experiment design.
 """
 
 
@@ -45,92 +35,74 @@ def generate_cover_letter(job_title: str, company: str, job_description: str) ->
             msg = client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=500,
-                messages=[{"role": "user", "content": f"""Write a concise cover letter (3 paragraphs, ~200 words) for:
-Job: {job_title} at {company}
-Description: {job_description[:1200]}
-Applicant: {RESUME_SUMMARY}
-Rules: specific achievements, no "I am writing to express my interest", output body only (no header/signature)"""}],
+                messages=[{"role": "user", "content": (
+                    f"Write a concise cover letter (3 paragraphs, ~200 words) for:\n"
+                    f"Job: {job_title} at {company}\n"
+                    f"Description: {job_description[:1200]}\n"
+                    f"Applicant: {RESUME_SUMMARY}\n"
+                    f"Rules: specific achievements, no clichés, output body only (no header/signature)"
+                )}],
             )
             return msg.content[0].text.strip()
         except Exception as exc:
-            print(f"[applier] Claude cover letter failed ({exc}), using generic")
+            print(f"[applier] Claude cover letter failed ({exc}), using fallback")
 
     return (
         f"I'm excited to apply for the {job_title} role at {company}. "
         f"With 8+ years building production ML and data systems at Microsoft — including "
-        f"adaptive stress-testing for Azure Storage (prevented 10+ Sev1/Sev2 incidents), "
-        f"multi-touch partner attribution pipelines (+10% MoM revenue), and an LLM-powered "
-        f"customer health agent that cut aging CRIs by 50% — I bring a strong track record "
-        f"of turning complex data problems into measurable business outcomes.\n\n"
-        f"I thrive owning end-to-end pipelines from experimentation through production, and "
-        f"I'm energized by the opportunity to bring this depth of experience to {company}. "
-        f"I'd love to connect and learn more about the team."
+        f"adaptive stress-testing for Azure Storage (10+ Sev1/Sev2 incidents prevented), "
+        f"multi-touch attribution pipelines (+10% MoM revenue), and an LLM-powered "
+        f"customer health agent (50% reduction in aging CRIs) — I bring a consistent "
+        f"record of turning complex data problems into measurable outcomes.\n\n"
+        f"I thrive owning end-to-end pipelines from experimentation through production "
+        f"and would love to bring this depth of experience to {company}."
     )
 
 
-# ── Combobox helper ───────────────────────────────────────────────────────────
-async def select_combobox(page: Page, field_id: str, option_text: str, timeout: int = 5000):
-    """Click a Greenhouse React-Select combobox and pick the matching option."""
+def answer_custom_question(question: str, job_title: str, company: str) -> str:
+    """Use Claude to answer a job-specific custom question, or return empty string."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return ""
     try:
-        inp = await page.wait_for_selector(f'[id="{field_id}"]', timeout=timeout)
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=300,
+            messages=[{"role": "user", "content": (
+                f"Answer this job application question concisely (2-4 sentences) for "
+                f"{job_title} at {company}:\n\nQuestion: {question}\n\n"
+                f"Applicant background: {RESUME_SUMMARY}\n\n"
+                f"Answer directly and specifically. No fluff."
+            )}],
+        )
+        return msg.content[0].text.strip()
+    except Exception:
+        return ""
+
+
+# ── Combobox helpers (React-Select / Greenhouse custom dropdowns) ─────────────
+async def _combobox_select(frame: Frame, field_id: str, option_text: str, timeout: int = 5000) -> bool:
+    """Type into a combobox and click the first visible option matching option_text."""
+    try:
+        inp = await frame.wait_for_selector(f'[id="{field_id}"]', timeout=timeout)
         await inp.click()
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.3)
         await inp.fill(option_text)
-        await asyncio.sleep(0.5)
-        options = await page.query_selector_all('[role="option"]')
+        await asyncio.sleep(0.6)
+        options = await frame.query_selector_all('[role="option"]')
         for opt in options:
             try:
                 if not await opt.is_visible():
                     continue
                 text = (await opt.inner_text()).strip()
-                if text.lower() == option_text.lower():
+                if option_text.lower() in text.lower():
                     await opt.click()
                     await asyncio.sleep(0.3)
                     return True
             except Exception:
                 continue
-        return False
-    except Exception as exc:
-        print(f"[applier] combobox [id={field_id!r}] → {option_text!r} failed: {exc}")
-        return False
-
-
-async def select_combobox_first(page: Page, field_id: str, timeout: int = 5000):
-    """Open a combobox and pick the first available option (for EEOC decline)."""
-    try:
-        inp = await page.wait_for_selector(f"#{field_id}", timeout=timeout)
-        await inp.click()
-        await asyncio.sleep(0.5)
-        option = await page.wait_for_selector('[role="option"]', timeout=3000)
-        await option.click()
-        await asyncio.sleep(0.3)
-        return True
-    except Exception as exc:
-        print(f"[applier] combobox first #{field_id} failed: {exc}")
-        return False
-
-
-async def select_combobox_containing(page: Page, field_id: str, partial: str, timeout: int = 5000):
-    """Pick the first visible option whose text contains `partial` (case-insensitive)."""
-    try:
-        inp = await page.wait_for_selector(f'[id="{field_id}"]', timeout=timeout)
-        await inp.click()
-        await asyncio.sleep(0.4)
-        await inp.fill(partial)
-        await asyncio.sleep(0.6)
-        options = await page.query_selector_all('[role="option"]')
-        for opt in options:
-            try:
-                if not await opt.is_visible():
-                    continue
-                text = (await opt.inner_text()).strip().lower()
-                if partial.lower() in text:
-                    await opt.click()
-                    await asyncio.sleep(0.3)
-                    return True
-            except Exception:
-                continue
-        # fallback: click first visible
+        # fallback: first visible option
         for opt in options:
             try:
                 if await opt.is_visible():
@@ -139,148 +111,234 @@ async def select_combobox_containing(page: Page, field_id: str, partial: str, ti
                     return True
             except Exception:
                 continue
-        return True
     except Exception as exc:
-        print(f"[applier] combobox containing [id={field_id!r}] → {partial!r} failed: {exc}")
-        return False
+        print(f"[applier] combobox [id={field_id!r}] → {option_text!r} failed: {exc}")
+    return False
 
 
-# ── Greenhouse form ───────────────────────────────────────────────────────────
-async def _apply_greenhouse(page: Page, job, cover_letter: str) -> bool:
-    print("[applier] filling Greenhouse form …")
+async def _combobox_decline(frame: Frame, field_id: str, timeout: int = 4000) -> bool:
+    """Open a combobox and pick the 'decline / prefer not to answer' option."""
+    decline_terms = ["decline", "prefer not", "i don't wish", "choose not", "no response"]
+    try:
+        inp = await frame.wait_for_selector(f'[id="{field_id}"]', timeout=timeout)
+        await inp.click()
+        await asyncio.sleep(0.5)
+        options = await frame.query_selector_all('[role="option"]')
+        for opt in options:
+            try:
+                if not await opt.is_visible():
+                    continue
+                text = (await opt.inner_text()).strip().lower()
+                if any(t in text for t in decline_terms):
+                    await opt.click()
+                    await asyncio.sleep(0.3)
+                    return True
+            except Exception:
+                continue
+        # fallback: last visible option (usually decline)
+        visible = [o for o in options]
+        if visible:
+            await visible[-1].click()
+            await asyncio.sleep(0.3)
+            return True
+    except Exception as exc:
+        print(f"[applier] combobox decline [id={field_id!r}] failed: {exc}")
+    return False
 
-    # Basic fields
-    for field_id, value in [
-        ("first_name",  PROFILE["first_name"]),
-        ("last_name",   PROFILE["last_name"]),
-        ("email",       PROFILE["email"]),
-        ("phone",       PROFILE["phone"]),
+
+# ── Phone country code ────────────────────────────────────────────────────────
+async def _set_phone_country(frame: Frame):
+    """Select United States (+1) in the phone country-code picker."""
+    try:
+        country_inp = await frame.wait_for_selector('[id="country"]', timeout=4000)
+        await country_inp.click()
+        await asyncio.sleep(0.3)
+        await country_inp.fill("United States")
+        await asyncio.sleep(0.6)
+        options = await frame.query_selector_all('[role="option"]')
+        for opt in options:
+            try:
+                if not await opt.is_visible():
+                    continue
+                text = (await opt.inner_text()).strip()
+                if "United States" in text:
+                    await opt.click()
+                    await asyncio.sleep(0.3)
+                    return
+            except Exception:
+                continue
+    except Exception as exc:
+        print(f"[applier] phone country code failed: {exc}")
+
+
+# ── Core form filler (works in any Frame — page or iframe) ───────────────────
+async def _fill_greenhouse_form(frame: Frame, job, cover_letter: str) -> bool:
+    # ── Basic fields ──────────────────────────────────────────────────────────
+    for fid, val in [
+        ("first_name", PROFILE["first_name"]),
+        ("last_name",  PROFILE["last_name"]),
+        ("email",      PROFILE["email"]),
+        ("phone",      PROFILE["phone"]),
     ]:
         try:
-            el = await page.wait_for_selector(f"#{field_id}", timeout=4000)
-            await el.fill(value)
+            el = await frame.wait_for_selector(f'#{fid}', timeout=4000)
+            await el.fill(val)
         except PWTimeout:
-            print(f"[applier] field #{field_id} not found, skipping")
+            pass
 
-    # Location
+    # Phone country code → +1
+    await _set_phone_country(frame)
+    # Re-fill phone (country picker sometimes clears it)
     try:
-        loc = await page.wait_for_selector("#candidate-location", timeout=3000)
-        await loc.fill(PROFILE["location"])
-        await asyncio.sleep(0.6)
-        # dismiss autocomplete if it appears
-        await page.keyboard.press("Escape")
+        ph = await frame.wait_for_selector("#phone", timeout=3000)
+        await ph.fill(PROFILE["phone"])
     except PWTimeout:
         pass
 
-    # Resume upload
+    # Location
+    try:
+        loc = await frame.wait_for_selector("#candidate-location", timeout=3000)
+        await loc.fill(PROFILE["location"])
+        await asyncio.sleep(0.5)
+        await frame.keyboard.press("Escape")
+    except PWTimeout:
+        pass
+
+    # ── Resume ────────────────────────────────────────────────────────────────
     resume_path = PROFILE["resume_path"]
     if os.path.exists(resume_path):
         try:
-            file_input = await page.wait_for_selector("#resume", timeout=4000)
-            await file_input.set_input_files(resume_path)
+            fi = await frame.wait_for_selector("#resume", timeout=4000)
+            await fi.set_input_files(resume_path)
             print("[applier] resume uploaded")
         except PWTimeout:
             print("[applier] resume input not found")
     else:
         print(f"[applier] resume not found at {resume_path}")
 
-    # Cover letter — write to temp file and upload
+    # ── Cover letter (file upload) ────────────────────────────────────────────
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                      prefix="cover_letter_", delete=False) as tmp:
+                                     prefix="cover_letter_", delete=False) as tmp:
         tmp.write(cover_letter)
         cl_path = tmp.name
     try:
-        cl_input = await page.wait_for_selector("#cover_letter", timeout=3000)
-        await cl_input.set_input_files(cl_path)
+        cl_fi = await frame.wait_for_selector("#cover_letter", timeout=3000)
+        await cl_fi.set_input_files(cl_path)
         print("[applier] cover letter uploaded")
     except PWTimeout:
-        print("[applier] cover letter input not found, skipping")
+        pass
     finally:
         os.unlink(cl_path)
 
-    # ── Custom questions ───────────────────────────────────────────────────────
-    # Scan all question_* fields by their label and fill appropriately
-    question_inputs = await page.query_selector_all("input[id^='question_']")
+    # ── Custom questions ──────────────────────────────────────────────────────
+    question_inputs = await frame.query_selector_all("input[id^='question_'], textarea[id^='question_']")
     for inp in question_inputs:
-        qid = await inp.get_attribute("id")
-        label = await page.evaluate(f"""() => {{
-            const lbl = document.querySelector("label[for='{qid}']");
-            return lbl ? lbl.innerText.toLowerCase() : "";
-        }}""")
+        qid   = await inp.get_attribute("id")
+        label = await inp.evaluate(
+            'el => { const l = document.querySelector("label[for=" + JSON.stringify(el.id) + "]"); '
+            'return l ? l.innerText.trim().toLowerCase() : ""; }'
+        )
+        tag   = await inp.evaluate("el => el.tagName")
 
         if "linkedin" in label:
             pass  # skip — not available
+
         elif "hear about" in label or "how did you" in label:
-            await select_combobox_containing(page, qid, "job board")
+            await _combobox_select(frame, qid, PROFILE["referral_source"])
+
         elif "current" in label and "company" in label:
             try:
-                el = await page.wait_for_selector(f"#{qid}", timeout=2000)
-                await el.fill(PROFILE["current_company"])
-            except PWTimeout:
+                await inp.fill(PROFILE["current_company"])
+            except Exception:
                 pass
+
         elif "years" in label and "experience" in label:
             try:
-                el = await page.wait_for_selector(f"#{qid}", timeout=2000)
-                await el.fill(PROFILE["years_experience"])
-            except PWTimeout:
+                await inp.fill(PROFILE["years_experience"])
+            except Exception:
                 pass
-        elif "authorized" in label or "work in the u" in label:
-            await select_combobox(page, qid, PROFILE["work_authorized"])
-        elif "sponsor" in label or "immigration" in label or "visa" in label:
-            await select_combobox(page, qid, PROFILE["requires_sponsorship"])
-        elif "privacy" in label or "i agree" in label or "candidate privacy" in label:
-            await select_combobox_containing(page, qid, "I agree")
 
-    # EEOC / DEI questions (numeric IDs: gender, transgender, orientation, disability, veteran)
-    eeoc_ids = ["430", "431", "432", "433", "434"]
-    decline_terms = ["decline", "prefer not", "i don't wish", "choose not"]
-    for eid in eeoc_ids:
+        elif "authorized" in label or ("work" in label and ("country" in label or "u.s" in label or "united states" in label)):
+            await _combobox_select(frame, qid, PROFILE["work_authorized"])
+
+        elif "sponsor" in label or "immigration" in label or "visa" in label:
+            await _combobox_select(frame, qid, PROFILE["requires_sponsorship"])
+
+        elif "privacy" in label or "i agree" in label or "candidate privacy" in label:
+            await _combobox_select(frame, qid, "I agree")
+
+        elif "gender" in label:
+            await _combobox_select(frame, qid, PROFILE["gender_eeoc"])
+
+        elif "veteran" in label:
+            await _combobox_decline(frame, qid)
+
+        elif "race" in label or "ethnicity" in label:
+            await _combobox_decline(frame, qid)
+
+        elif "disability" in label:
+            await _combobox_decline(frame, qid)
+
+        elif "transgender" in label or "sexual" in label or "orientation" in label:
+            await _combobox_decline(frame, qid)
+
+        elif tag == "TEXTAREA":
+            # Job-specific open-ended question — ask Claude
+            answer = answer_custom_question(label, job.title, job.company)
+            if answer:
+                try:
+                    await inp.fill(answer)
+                except Exception:
+                    pass
+
+    # ── "Decline all EEOC" checkbox (Airbnb pattern) ─────────────────────────
+    # Some forms have a single "I decline to answer" checkbox instead of dropdowns
+    try:
+        decline_cb = await frame.query_selector("input[type='checkbox'][id*='question_']")
+        if decline_cb:
+            label = await decline_cb.evaluate(
+                'el => { const l = document.querySelector("label[for=" + JSON.stringify(el.id) + "]"); '
+                'return l ? l.innerText.trim().toLowerCase() : ""; }'
+            )
+            if "decline" in label or "prefer not" in label:
+                await decline_cb.check()
+                await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+    # ── EEOC numeric-id fields (Reddit pattern: #430 etc.) ───────────────────
+    for eid in ["430", "431", "432", "433", "434"]:
         try:
-            # CSS IDs starting with digits need attribute selector
-            el = await page.query_selector(f'[id="{eid}"]')
-            if not el:
-                continue
-            await el.click()
-            await asyncio.sleep(0.5)
-            options = await page.query_selector_all('[role="option"]')
-            declined = False
-            for opt in options:
-                text = (await opt.inner_text()).strip().lower()
-                if any(t in text for t in decline_terms):
-                    await opt.click()
-                    declined = True
-                    break
-            if not declined and options:
-                await options[-1].click()
-            await asyncio.sleep(0.3)
-        except Exception as exc:
-            print(f"[applier] EEOC [id={eid!r}] failed: {exc}")
+            el = await frame.query_selector(f'[id="{eid}"]')
+            if el:
+                await _combobox_decline(frame, eid)
+        except Exception:
+            pass
 
     await asyncio.sleep(1)
 
-    # Submit
-    for sel in ["button[type='submit']", "input[type='submit']",
-                "button:has-text('Submit application')", "button:has-text('Submit')"]:
+    # ── Submit ────────────────────────────────────────────────────────────────
+    for sel in [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Submit application')",
+        "button:has-text('Submit')",
+    ]:
         try:
-            btn = await page.wait_for_selector(sel, timeout=3000)
+            btn = await frame.wait_for_selector(sel, timeout=3000)
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(0.5)
             await btn.click()
-            print("[applier] submit clicked, waiting for confirmation …")
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            await asyncio.sleep(2)
-            # Screenshot for verification
-            screenshot_path = f"/tmp/apply_{job.company}_{job.id}.png"
-            await page.screenshot(path=screenshot_path, full_page=False)
-            print(f"[applier] screenshot saved: {screenshot_path}")
-            # Check for success indicators
-            content = (await page.content()).lower()
+            print("[applier] submit clicked, waiting …")
+            # wait on the parent page, not the frame
+            await asyncio.sleep(5)
+            content = (await frame.content()).lower()
             if any(w in content for w in ["thank you", "application received",
                                            "successfully submitted", "we'll be in touch"]):
-                print("[applier] success confirmed")
+                print("[applier] success confirmed via page content")
                 return True
-            print("[applier] submitted — check screenshot to verify")
-            return True  # assume success if no error
+            print("[applier] submitted — verify via screenshot")
+            return True
         except PWTimeout:
             continue
 
@@ -288,17 +346,56 @@ async def _apply_greenhouse(page: Page, job, cover_letter: str) -> bool:
     return False
 
 
-# ── Lever form ────────────────────────────────────────────────────────────────
+# ── Platform detection & orchestration ───────────────────────────────────────
+def _is_greenhouse(url: str) -> bool:
+    return any(h in url for h in ["greenhouse.io", "careerpuck.com", "gh_jid="])
+
+def _is_lever(url: str) -> bool:
+    return "lever.co" in url
+
+
+async def _get_greenhouse_frame(page: Page, timeout: int = 8000) -> Frame:
+    """Return the Greenhouse form frame (iframe or main page)."""
+    deadline = asyncio.get_event_loop().time() + timeout / 1000
+    while asyncio.get_event_loop().time() < deadline:
+        for f in page.frames:
+            if "greenhouse.io/embed" in f.url or "greenhouse.io/job_app" in f.url:
+                return f
+        await asyncio.sleep(0.5)
+    # No iframe found — form is on the main page
+    return page.main_frame
+
+
+async def _click_apply_button(page: Page):
+    """Click an Apply / Apply Now button if present (company career pages)."""
+    for sel in [
+        "a:has-text('Apply Now')",
+        "button:has-text('Apply Now')",
+        "a:has-text('Apply for this job')",
+        "button:has-text('Apply for this job')",
+        "a:has-text('Apply')",
+        "button:has-text('Apply')",
+    ]:
+        try:
+            btn = await page.wait_for_selector(sel, timeout=3000)
+            await btn.click()
+            await page.wait_for_load_state("networkidle", timeout=8000)
+            await asyncio.sleep(1)
+            return
+        except PWTimeout:
+            continue
+
+
 async def _apply_lever(page: Page, job, cover_letter: str) -> bool:
     print("[applier] filling Lever form …")
-    for sel, value in [
+    for sel, val in [
         ("input[name='name']",  f"{PROFILE['first_name']} {PROFILE['last_name']}"),
         ("input[name='email']", PROFILE["email"]),
-        ("input[name='phone']", PROFILE["phone"]),
+        ("input[name='phone']", PROFILE["phone_country_code"] + PROFILE["phone"]),
     ]:
         try:
             el = await page.wait_for_selector(sel, timeout=3000)
-            await el.fill(value)
+            await el.fill(val)
         except PWTimeout:
             pass
 
@@ -327,20 +424,9 @@ async def _apply_lever(page: Page, job, cover_letter: str) -> bool:
     return False
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def _is_greenhouse(url: str) -> bool:
-    return any(h in url for h in ["greenhouse.io", "careerpuck.com", "gh_jid="])
-
-def _is_lever(url: str) -> bool:
-    return "lever.co" in url
-
-
+# ── Main entry ────────────────────────────────────────────────────────────────
 async def _do_apply(job) -> dict:
-    cover_letter = generate_cover_letter(
-        job_title=job.title,
-        company=job.company,
-        job_description=job.description or "",
-    )
+    cover_letter = generate_cover_letter(job.title, job.company, job.description or "")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -354,20 +440,33 @@ async def _do_apply(job) -> dict:
         )
         page = await ctx.new_page()
         try:
-            print(f"[applier] navigating to {job.url}")
+            print(f"[applier] → {job.url}")
             await page.goto(job.url, wait_until="networkidle", timeout=25000)
 
             if _is_greenhouse(job.url):
-                success = await _apply_greenhouse(page, job, cover_letter)
+                # Some URLs land on a company career page with an Apply button
+                await _click_apply_button(page)
+                # Get the form frame (iframe embed or main page)
+                frame = await _get_greenhouse_frame(page)
+                print(f"[applier] form frame: {frame.url[:70]}")
+                success = await _fill_greenhouse_form(frame, job, cover_letter)
+
             elif _is_lever(job.url):
                 success = await _apply_lever(page, job, cover_letter)
+
             else:
-                print(f"[applier] unknown platform, leaving browser open for manual fill")
+                print("[applier] unknown platform — leaving browser open 60s for manual fill")
                 await asyncio.sleep(60)
                 success = False
 
+            # Screenshot for verification
+            screenshot_path = f"/tmp/apply_{job.company}_{job.id}.png"
+            await page.screenshot(path=screenshot_path, full_page=False)
+            print(f"[applier] screenshot → {screenshot_path}")
+
             await asyncio.sleep(3)
             return {"success": success, "cover_letter": cover_letter}
+
         except Exception as exc:
             print(f"[applier] error: {exc}")
             return {"success": False, "error": str(exc), "cover_letter": cover_letter}
@@ -376,5 +475,4 @@ async def _do_apply(job) -> dict:
 
 
 def apply_to_job(job) -> dict:
-    """Synchronous wrapper — called from FastAPI background task."""
     return asyncio.run(_do_apply(job))
