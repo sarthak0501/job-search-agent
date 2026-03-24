@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from core.models import Job, get_engine, init_db, make_session_factory
 from core.scheduler import start_scheduler, stop_scheduler
 from core.fetcher import fetch_and_store
+from core.applier import apply_to_job
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR      = pathlib.Path(__file__).resolve().parents[1]   # apps/
@@ -56,7 +57,7 @@ def index(request: Request, db: Session = Depends(get_db)):
         "approved": db.query(Job).filter_by(status="approved").count(),
         "applied":  db.query(Job).filter_by(status="applied").count(),
     }
-    return templates.TemplateResponse("index.html", {"request": request, "stats": stats})
+    return templates.TemplateResponse(request, "index.html", {"stats": stats})
 
 
 @app.get("/queue", response_class=HTMLResponse)
@@ -72,8 +73,7 @@ def queue_page(
         .all()
     )
     return templates.TemplateResponse(
-        "queue.html",
-        {"request": request, "jobs": jobs, "current_status": status},
+        request, "queue.html", {"jobs": jobs, "current_status": status},
     )
 
 
@@ -128,16 +128,43 @@ def reject_job(job_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/api/jobs/{job_id}/apply")
-def apply_job(job_id: int, db: Session = Depends(get_db)):
+def apply_job(job_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status not in ("new", "approved"):
         raise HTTPException(400, f"Cannot apply to a job with status '{job.status}'")
-    job.status     = "applied"
-    job.applied_at = datetime.datetime.utcnow()
+
+    # Mark as applying immediately so UI reflects it
+    job.status = "applying"
     db.commit()
-    return {"id": job_id, "status": "applied", "applied_at": job.applied_at.isoformat()}
+
+    def _run_apply(job_id: int):
+        # Fresh DB session for background thread
+        bg_session = _SessionFactory()
+        try:
+            bg_job = bg_session.get(Job, job_id)
+            result = apply_to_job(bg_job)
+            if result.get("success"):
+                bg_job.status     = "applied"
+                bg_job.applied_at = datetime.datetime.utcnow()
+            else:
+                bg_job.status = "approved"
+                print(f"[applier] job {job_id} failed: {result.get('error', 'unknown')}")
+            bg_session.commit()
+        except Exception as exc:
+            print(f"[applier] job {job_id} exception: {exc}")
+            try:
+                bg_job = bg_session.get(Job, job_id)
+                bg_job.status = "approved"
+                bg_session.commit()
+            except Exception:
+                pass
+        finally:
+            bg_session.close()
+
+    background_tasks.add_task(_run_apply, job_id)
+    return {"id": job_id, "status": "applying", "message": "Browser opened — application in progress"}
 
 
 @app.post("/api/fetch")

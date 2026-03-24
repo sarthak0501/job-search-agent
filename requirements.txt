@@ -9,3 +9,5 @@ httpx
 sentence-transformers
 weasyprint
 watchfiles
+playwright
+anthropic

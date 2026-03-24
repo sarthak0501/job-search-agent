@@ -6,25 +6,39 @@ app:
 # Edit target_titles, skills, and locations to match your background.
 profile:
   target_titles:
-    - "software engineer"
-    - "backend engineer"
-    - "full stack engineer"
-    - "software developer"
+    - "senior data scientist"
+    - "data scientist"
+    - "applied scientist"
+    - "senior applied scientist"
+    - "staff data scientist"
+    - "principal data scientist"
+    - "ml engineer"
+    - "machine learning engineer"
+    - "data science manager"
   skills:
     - python
-    - fastapi
     - sql
-    - postgresql
-    - rest api
-    - docker
-    - kubernetes
-    - aws
-    - git
+    - pyspark
     - machine learning
+    - statistical modeling
+    - nlp
+    - azure
+    - data pipelines
+    - telemetry
+    - experimentation
+    - multi-armed bandit
+    - optimization
+    - clustering
+    - classification
+    - llm
+    - power bi
+    - tableau
+    - r
   locations:
-    - "san francisco"
-    - "new york"
+    - "redmond"
+    - "seattle"
     - "remote"
+    - "new york"
 
 # ── Compliance ────────────────────────────────────────────────────────────────
 compliance:
@@ -33,10 +47,13 @@ compliance:
   allow_domains: []         # empty = allow all except denied
   deny_domains: ["linkedin.com", "www.linkedin.com"]
   rate_limits:
-    default_per_minute: 30
+    default_per_minute: 10000
     overrides:
-      boards-api.greenhouse.io: 60
-      api.lever.co: 60
+      boards-api.greenhouse.io: 10000
+      api.lever.co: 10000
+      job-boards.greenhouse.io: 10000
+      boards.greenhouse.io: 10000
+      app.careerpuck.com: 10000
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 # Add company slugs under each plugin.
@@ -49,16 +66,23 @@ sources:
       - "reddit"
       - "airbnb"
       - "stripe"
-      - "notion"
+      - "databricks"
+      - "lyft"
+      - "robinhood"
+      - "twilio"
+      - "waymo"
+      - "duolingo"
+      - "klaviyo"
+      - "brex"
 
   - plugin: "lever"
     enabled: true
     companies:
       - "netflix"
-      - "figma"
-      - "discord"
+      - "scale"
+      - "gemini"
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
 scoring:
   base: "hybrid_v1"
-  threshold: 60            # minimum score (0-100) to store a job
+  threshold: 50            # minimum score (0-100) to store a job

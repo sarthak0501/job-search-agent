@@ -61,6 +61,7 @@ footer { text-align: center; padding: 20px; color: #999; font-size: 12px; }
 .job-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .job-status-badge { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; text-transform: uppercase; letter-spacing: .05em; }
 .status-applied  { background: #dbeafe; color: #1d4ed8; }
+.status-applying { background: #fef9c3; color: #854d0e; }
 .status-rejected { background: #fee2e2; color: #dc2626; }
 .status-approved { background: #dcfce7; color: #16a34a; }
 
