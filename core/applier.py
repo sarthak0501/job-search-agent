@@ -3,6 +3,9 @@ from __future__ import annotations
 applier.py – orchestrates job application using sync Playwright.
 
 Sync API avoids asyncio conflicts when called from FastAPI background threads.
+Integrates:
+  - StateTracker (loop/stuck detection)
+  - DebugArtifacts (structured debug output per attempt)
 """
 import os
 import subprocess
@@ -13,6 +16,7 @@ from playwright.sync_api import sync_playwright, Page, Frame, TimeoutError as PW
 
 from core.profile_store import load_profile
 from core.ai_filler import ai_fill_form, CLAUDE_BIN
+from core.debug_artifacts import DebugArtifacts
 
 RESUME_SUMMARY = """
 Senior Data Scientist (8+ years) at Microsoft — adaptive stress-testing for Azure
@@ -117,6 +121,7 @@ def _click_apply_button(page: Page) -> None:
     for sel in [
         "a:has-text('Apply Now')", "button:has-text('Apply Now')",
         "a:has-text('Apply for this job')", "button:has-text('Apply for this job')",
+        "a:has-text('Easy Apply')", "button:has-text('Easy Apply')",
     ]:
         try:
             btn = page.wait_for_selector(sel, timeout=2500)
@@ -141,7 +146,15 @@ def _get_greenhouse_frame(page: Page, timeout: float = 8.0) -> Frame:
 
 # ── Main entry ────────────────────────────────────────────────────────────────
 def apply_to_job(job) -> dict:
-    """Synchronous — safe to call from any thread."""
+    """
+    Synchronous — safe to call from any thread.
+
+    Returns dict with:
+      success: bool
+      cover_letter: str
+      error: str (if failure)
+      debug_dir: str (path to debug artifacts)
+    """
     readiness = get_apply_readiness(check_browser=False)
     if not readiness["ready"]:
         return {"success": False, "error": readiness["error"]}
@@ -151,6 +164,10 @@ def apply_to_job(job) -> dict:
     cover_letter = generate_cover_letter(
         job.title, job.company, job.description or ""
     )
+
+    # Initialise debug artifact writer
+    job_id = getattr(job, "id", "unknown")
+    debug = DebugArtifacts(job_id=job_id, attempt=1)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=_should_launch_headless())
@@ -175,17 +192,55 @@ def apply_to_job(job) -> dict:
                 frame = page.main_frame
 
             print(f"[applier] frame: {frame.url[:80]}")
-            success = ai_fill_form(page, frame, profile, cover_letter)
 
-            screenshot_path = f"/tmp/apply_{job.company}_{job.id}.png"
-            page.screenshot(path=screenshot_path, full_page=False)
-            print(f"[applier] screenshot → {screenshot_path}")
+            # Take initial screenshot
+            debug.take_screenshot(page, "initial_page")
+
+            success = ai_fill_form(page, frame, profile, cover_letter, debug=debug)
+
+            # Take final screenshot
+            debug.take_screenshot(page, "final_state")
+
+            # Write all debug artifacts
+            failure_reason = "" if success else "ai_fill_form returned False"
+            debug_dir = debug.write(failure_reason=failure_reason)
+            print(f"[applier] debug artifacts → {debug_dir}")
+
+            if not success:
+                # If stuck/loop was detected, mark as failed (not re-queueable)
+                state_log = debug._states
+                stuck = any(
+                    s.get("classification") == "stuck"
+                    for s in state_log
+                )
+                if stuck:
+                    return {
+                        "success": False,
+                        "error": f"Apply loop detected (stuck). Debug: {debug_dir}",
+                        "cover_letter": cover_letter,
+                        "debug_dir": debug_dir,
+                        "failed_permanently": True,
+                    }
 
             time.sleep(3)
-            return {"success": success, "cover_letter": cover_letter}
+            return {
+                "success": success,
+                "cover_letter": cover_letter,
+                "debug_dir": debug_dir,
+            }
 
         except Exception as exc:
             print(f"[applier] error: {exc}")
-            return {"success": False, "error": str(exc), "cover_letter": cover_letter}
+            try:
+                debug.take_screenshot(page, "error_state")
+                debug_dir = debug.write(failure_reason=str(exc))
+            except Exception:
+                debug_dir = ""
+            return {
+                "success": False,
+                "error": str(exc),
+                "cover_letter": cover_letter,
+                "debug_dir": debug_dir,
+            }
         finally:
             browser.close()

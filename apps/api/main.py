@@ -239,11 +239,17 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
         try:
             bg_job = bg.get(Job, job_id)
             result = apply_to_job(bg_job)
-            bg_job.status = "applied" if result.get("success") else "approved"
             if result.get("success"):
+                bg_job.status = "applied"
                 bg_job.applied_at = datetime.datetime.utcnow()
                 bg_job.last_error = ""
+            elif result.get("failed_permanently"):
+                # Stuck / loop detected — move to failed so it won't be retried
+                bg_job.status = "failed"
+                bg_job.last_error = result.get("error", "Apply loop detected")
+                print(f"[apply] job {job_id} permanently failed: {result.get('error','unknown')}")
             else:
+                bg_job.status = "approved"
                 bg_job.last_error = result.get("error", "Unknown apply error")
                 print(f"[apply] job {job_id} failed: {result.get('error','unknown')}")
             bg.commit()
