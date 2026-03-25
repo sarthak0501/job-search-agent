@@ -18,7 +18,7 @@ class Job(Base):
     url         = Column(String, default="")
     description = Column(Text,   default="")
     score       = Column(Float,  default=0.0)
-    status      = Column(String, default="new")    # new | approved | rejected | applying | applied | failed
+    status      = Column(String, default="new")    # new | approved | rejected | applying | applied | failed | needs_review | blocked
     last_error  = Column(Text,   default="")
     fetched_at  = Column(DateTime, default=datetime.datetime.utcnow)
     applied_at  = Column(DateTime, nullable=True)

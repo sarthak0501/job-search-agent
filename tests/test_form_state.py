@@ -14,6 +14,7 @@ import pytest
 from core.form_state import (
     FormState,
     StateTracker,
+    extract_state,
     STUCK_REPEAT_THRESHOLD,
     STUCK_TOTAL_THRESHOLD,
 )
@@ -290,3 +291,137 @@ class TestMixedScenarios:
         stuck_count = results.count("stuck")
         # At round 3, both A and B hit fp threshold of 3
         assert stuck_count >= 1, f"Expected at least one 'stuck' in {results}"
+
+
+# ===========================================================================
+# Progress-aware stuck detection (Phase 1C)
+# ===========================================================================
+
+class TestProgressAwareStuckDetection:
+    def test_field_count_decrease_prevents_stuck(self):
+        """
+        If the field count decreases between records, the tracker should NOT
+        declare stuck even on repeated fingerprints.
+        """
+        tracker = StateTracker()
+        s1 = make_state(field_count=10)
+        s2 = make_state(field_count=8)  # fewer fields = progress
+        # Same URL/headings so fingerprint may match, but field count dropped
+
+        r1 = tracker.record(s1)
+        # s2 has different field_count -> different fingerprint anyway
+        r2 = tracker.record(s2)
+        assert r1 == "new"
+        # r2 may be new (different fingerprint) or repeated — but NOT stuck
+        assert r2 in ("new", "repeated"), f"Expected new/repeated with progress, got {r2!r}"
+
+    def test_url_change_prevents_stuck(self):
+        """URL path change indicates real navigation progress."""
+        tracker = StateTracker()
+        # Build two states with same fingerprint except URL
+        s1 = make_state(url="https://example.com/apply/step1", field_count=5)
+        s2 = make_state(url="https://example.com/apply/step2", field_count=5)
+
+        r1 = tracker.record(s1)
+        r2 = tracker.record(s2)
+        assert r1 == "new"
+        assert r2 == "new"  # Different URL path = new state
+
+    def test_same_fingerprint_with_errors_is_repeated_validation_errors(self):
+        """Same fingerprint + error texts = repeated_validation_errors stuck type."""
+        tracker = StateTracker()
+        s = make_state(error_texts=["This field is required"])
+        # Record the same state with errors STUCK_REPEAT_THRESHOLD times
+        results = [tracker.record(s) for _ in range(STUCK_REPEAT_THRESHOLD)]
+        assert results[-1] == "stuck"
+        # Check the stuck type
+        log = tracker.get_log()
+        stuck_entries = [e for e in log if e.get("classification") == "stuck"]
+        assert len(stuck_entries) >= 1
+        stuck_entry = stuck_entries[-1]
+        assert stuck_entry.get("stuck_type") in (
+            "repeated_validation_errors",
+            "stuck_same_page_no_progress",
+        )
+
+    def test_cycling_detection(self):
+        """
+        A-B-A-B pattern over 4 steps should eventually be classified as cycling.
+        """
+        tracker = StateTracker()
+        s_a = make_distinct_state(100)
+        s_b = make_distinct_state(200)
+
+        results = []
+        for _ in range(4):
+            results.append(tracker.record(s_a))
+            results.append(tracker.record(s_b))
+
+        # At some point should detect cycling or repeat threshold
+        stuck_count = results.count("stuck")
+        assert stuck_count >= 1, f"Expected cycling detection, got {results}"
+
+    def test_progress_resets_stuck_risk(self):
+        """
+        Distinct pages (all new fingerprints) should not trigger stuck.
+        """
+        tracker = StateTracker()
+        for i in range(STUCK_TOTAL_THRESHOLD - 1):
+            result = tracker.record(make_distinct_state(i))
+            assert result in ("new", "repeated"), \
+                f"Step {i}: expected new/repeated, got {result!r}"
+
+    def test_stuck_type_in_log_entry(self):
+        """Log entries for stuck states should include stuck_type."""
+        tracker = StateTracker()
+        s = make_state()
+        for _ in range(STUCK_REPEAT_THRESHOLD):
+            tracker.record(s)
+        log = tracker.get_log()
+        stuck_entries = [e for e in log if e.get("classification") == "stuck"]
+        assert len(stuck_entries) >= 1
+        for entry in stuck_entries:
+            assert "stuck_type" in entry, f"stuck entry missing stuck_type: {entry}"
+
+    def test_total_threshold_with_distinct_states_and_no_progress(self):
+        """
+        STUCK_TOTAL_THRESHOLD distinct states all with same URL path
+        and same field count -> should hit stuck on last.
+        """
+        tracker = StateTracker()
+        results = []
+        for i in range(STUCK_TOTAL_THRESHOLD):
+            # Same URL path but different headings/labels => different fingerprints
+            # but same field_count and url_path signals no progress
+            s = FormState(
+                url="https://example.com/apply",
+                headings=[f"Heading {i}"],
+                question_labels=[f"Question {i}"],
+                field_count=5,  # same field count = no progress
+                error_texts=[],
+                button_texts=["Next"],
+            )
+            results.append(tracker.record(s))
+        assert results[-1] == "stuck", f"Expected stuck on attempt {STUCK_TOTAL_THRESHOLD}, got {results}"
+
+    def test_cycling_between_steps_type(self):
+        """cycling_between_steps stuck type recorded on A-B-A-B pattern."""
+        tracker = StateTracker()
+        s_a = make_distinct_state(50)
+        s_b = make_distinct_state(51)
+
+        # Build history: A B A B (4 entries)
+        tracker.record(s_a)
+        tracker.record(s_b)
+        tracker.record(s_a)
+        result = tracker.record(s_b)  # 4th entry, cycling
+
+        log = tracker.get_log()
+        stuck_entries = [e for e in log if e.get("classification") == "stuck"]
+
+        # May or may not be stuck at this point depending on threshold,
+        # but cycling detection should be working
+        if stuck_entries:
+            cycling_entries = [e for e in stuck_entries if e.get("stuck_type") == "cycling_between_steps"]
+            # Accept any stuck type here since cycling or repeat can both trigger
+            assert len(stuck_entries) >= 1

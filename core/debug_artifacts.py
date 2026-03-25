@@ -4,13 +4,20 @@ debug_artifacts.py – Write structured debug artifacts for every apply attempt.
 
 Writes to /tmp/apply_debug/{job_id}/{timestamp}/
 Files:
-  fields.json     – extracted field metadata from the page
-  mappings.json   – canonical key mappings (deterministic + LLM)
-  actions.json    – actions that were executed
-  states.json     – full state-tracker log
-  failure.txt     – failure reason (if any)
+  fields.json            – full FieldMeta list (selector_candidates included)
+  mappings.json          – canonical key mappings with confidence scores
+  actions_proposed.json  – LLM proposed actions (pre-validation)
+  actions_rejected.json  – rejected actions with rejection reason
+  actions_executed.json  – executed actions with per-action verification result
+  states.json            – full state-tracker log with page classifications
+  unresolved_fields.json – required fields that couldn't be filled before submit
+  page_classifications.json – page type at each step
+  failure.json           – structured failure type + reason
+  html_snapshot.html     – HTML snapshot (truncated to 200KB) per attempt
 
-Screenshots are taken at key moments and stored as PNG files.
+Screenshots are taken at key moments and stored as PNG files:
+  page_load, pre_fill, post_fill, pre_submit, post_submit, on_error
+
 Keeps the last MAX_DEBUG_DIRS directories per job_id (rotates old ones).
 """
 
@@ -23,6 +30,7 @@ from typing import Optional
 
 MAX_DEBUG_DIRS = 10
 DEBUG_ROOT = pathlib.Path("/tmp/apply_debug")
+MAX_HTML_SNAPSHOT = 200_000  # 200KB
 
 
 def _job_dir(job_id: str | int) -> pathlib.Path:
@@ -69,10 +77,17 @@ class DebugArtifacts:
         dbg = DebugArtifacts(job_id=42)
         dbg.record_fields(extracted_fields)
         dbg.record_mappings(canonical_mappings)
-        dbg.record_actions(actions_executed)
+        dbg.record_proposed_actions(actions)
+        dbg.record_rejected_actions(rejections)
+        dbg.record_executed_actions(executed)
         dbg.record_states(state_log)
-        dbg.take_screenshot(page, "before_submit")
-        dbg.write(failure_reason="stuck on step 2")
+        dbg.record_unresolved_fields(fields)
+        dbg.record_page_classification(step, page_type)
+        dbg.record_state_fingerprint(step, fingerprint)
+        dbg.take_screenshot(page, "pre_fill")
+        dbg.record_html_snapshot(html)
+        dbg.set_structured_failure(failure_type, reason)
+        dbg.write()
     """
 
     def __init__(self, job_id: str | int, attempt: int = 1) -> None:
@@ -83,10 +98,19 @@ class DebugArtifacts:
 
         self._fields: list[dict] = []
         self._mappings: list[dict] = []
+        self._proposed_actions: list[dict] = []
+        self._rejected_actions: list[dict] = []
+        self._executed_actions: list[dict] = []
+        # Legacy: kept for backward compat
         self._actions: list[dict] = []
         self._states: list[dict] = []
+        self._unresolved_fields: list[dict] = []
+        self._page_classifications: list[dict] = []
+        self._state_fingerprints: list[dict] = []
         self._screenshots: list[str] = []
+        self._html_snapshots: list[dict] = []
         self._failure_reason: str = ""
+        self._failure_type: Optional[str] = None
 
     def _ensure_dir(self) -> pathlib.Path:
         if self._dir is None:
@@ -100,22 +124,63 @@ class DebugArtifacts:
     # ── Collection methods ────────────────────────────────────────────────────
 
     def record_fields(self, fields: list[dict]) -> None:
+        """Record full FieldMeta list (including selector_candidates)."""
         self._fields = list(fields)
 
     def record_mappings(self, mappings: list[dict]) -> None:
         """
-        mappings: list of {field_id, label, canonical_key, profile_value, confidence, source}
+        mappings: list of {field_id, label, canonical_key, profile_value,
+                            confidence, source}
         source = "deterministic" | "llm"
         """
         self._mappings = list(mappings)
 
+    def record_proposed_actions(self, actions: list[dict]) -> None:
+        """LLM proposed actions before validation."""
+        self._proposed_actions = list(actions)
+
+    def record_rejected_actions(self, rejections: list[dict]) -> None:
+        """Rejected actions: [{action, reason}]."""
+        self._rejected_actions = list(rejections)
+
+    def record_executed_actions(self, executed: list[dict]) -> None:
+        """Executed actions with per-action verification: [{action, result}]."""
+        self._executed_actions = list(executed)
+        # Also update legacy _actions for backward compat
+        self._actions = [e.get("action", e) for e in executed]
+
     def record_actions(self, actions: list[dict]) -> None:
+        """Legacy: record flat action list."""
         self._actions = list(actions)
 
     def record_states(self, state_log: list[dict]) -> None:
         self._states = list(state_log)
 
+    def record_unresolved_fields(self, fields: list[dict]) -> None:
+        """Record required fields that couldn't be resolved before submit."""
+        self._unresolved_fields = list(fields)
+
+    def record_page_classification(self, step: int, page_type: str) -> None:
+        """Record page type at each step."""
+        self._page_classifications.append({"step": step, "page_type": page_type})
+
+    def record_state_fingerprint(self, step: int, fingerprint: str) -> None:
+        """Record state fingerprint at each step."""
+        self._state_fingerprints.append({"step": step, "fingerprint": fingerprint})
+
+    def record_html_snapshot(self, html: str, step: int = 0) -> None:
+        """Store HTML snapshot (truncated to 200KB)."""
+        if len(html) > MAX_HTML_SNAPSHOT:
+            html = html[:MAX_HTML_SNAPSHOT] + "\n<!-- truncated -->"
+        self._html_snapshots.append({"step": step, "html": html})
+
     def set_failure(self, reason: str) -> None:
+        """Legacy: set failure reason string."""
+        self._failure_reason = reason
+
+    def set_structured_failure(self, failure_type: str, reason: str) -> None:
+        """Set structured failure type and reason."""
+        self._failure_type = failure_type
         self._failure_reason = reason
 
     def take_screenshot(self, page, label: str = "screenshot") -> str:
@@ -143,10 +208,39 @@ class DebugArtifacts:
 
         _safe_write_json(d / "fields.json", self._fields)
         _safe_write_json(d / "mappings.json", self._mappings)
-        _safe_write_json(d / "actions.json", self._actions)
+
+        # Action files
+        if self._proposed_actions:
+            _safe_write_json(d / "actions_proposed.json", self._proposed_actions)
+        if self._rejected_actions:
+            _safe_write_json(d / "actions_rejected.json", self._rejected_actions)
+        if self._executed_actions:
+            _safe_write_json(d / "actions_executed.json", self._executed_actions)
+        # Legacy fallback
+        _safe_write_json(d / "actions.json", self._actions or self._executed_actions)
+
         _safe_write_json(d / "states.json", self._states)
 
+        if self._unresolved_fields:
+            _safe_write_json(d / "unresolved_fields.json", self._unresolved_fields)
+
+        if self._page_classifications:
+            _safe_write_json(d / "page_classifications.json", self._page_classifications)
+
+        if self._state_fingerprints:
+            _safe_write_json(d / "state_fingerprints.json", self._state_fingerprints)
+
+        # HTML snapshots
+        for snap in self._html_snapshots:
+            step = snap.get("step", 0)
+            _safe_write_text(d / f"html_snapshot_step{step}.html", snap.get("html", ""))
+
         if self._failure_reason:
+            failure_data = {
+                "failure_type": self._failure_type,
+                "failure_reason": self._failure_reason,
+            }
+            _safe_write_json(d / "failure.json", failure_data)
             _safe_write_text(d / "failure.txt", self._failure_reason)
 
         # Write a summary manifest
@@ -156,9 +250,14 @@ class DebugArtifacts:
             "timestamp": self._timestamp,
             "field_count": len(self._fields),
             "mapping_count": len(self._mappings),
+            "proposed_action_count": len(self._proposed_actions),
+            "rejected_action_count": len(self._rejected_actions),
+            "executed_action_count": len(self._executed_actions),
             "action_count": len(self._actions),
             "state_count": len(self._states),
+            "unresolved_field_count": len(self._unresolved_fields),
             "screenshots": self._screenshots,
+            "failure_type": self._failure_type,
             "failure_reason": self._failure_reason,
         }
         _safe_write_json(d / "manifest.json", manifest)

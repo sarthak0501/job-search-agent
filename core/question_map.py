@@ -428,11 +428,17 @@ CATALOG: dict[str, dict] = {
         "negative_keywords": ["sponsorship", "visa", "sponsor"],
         "options_map": {
             "Yes": [
-                "Yes", "I am authorized", "I am legally authorized",
+                "Yes", "Y", "True", "1",
+                "I am authorized", "I am legally authorized",
                 "Yes, I am authorized to work", "Yes I am authorized",
                 "Authorized", "Yes, legally authorized",
+                "I am authorized to work",
             ],
-            "No": ["No", "I am not authorized", "No, I am not authorized"],
+            "No": [
+                "No", "N", "False", "0",
+                "I am not authorized", "No, I am not authorized",
+                "Not Authorized", "I am not authorized to work",
+            ],
         },
     },
 
@@ -456,11 +462,13 @@ CATALOG: dict[str, dict] = {
         "negative_keywords": ["authorized", "authorization", "legally"],
         "options_map": {
             "Yes": [
-                "Yes", "Yes I will", "I will require sponsorship",
+                "Yes", "Y", "True", "1",
+                "Yes I will", "I will require sponsorship",
                 "Yes, I require sponsorship", "Required", "Yes, will need sponsorship",
             ],
             "No": [
-                "No", "No I will not", "I will not require sponsorship",
+                "No", "N", "False", "0",
+                "No I will not", "I will not require sponsorship",
                 "Not required", "No, I do not require",
             ],
         },
@@ -788,6 +796,193 @@ CATALOG: dict[str, dict] = {
         "negative_keywords": ["resume"],
         "options_map": {},
     },
+
+    # ── Notice Period ───────────────────────────────────────────────────────────
+    "notice_period": {
+        "profile_key": "notice_period",
+        "type": "fill",
+        "keywords": ["notice", "notice period"],
+        "aliases": [
+            "notice period", "how much notice do you need",
+            "notice period required", "when can you start your notice",
+            "how many weeks notice", "required notice period",
+            "how soon can you start", "available to start",
+        ],
+        "negative_keywords": ["start date", "availability date"],
+        "options_map": {
+            "2 weeks": ["2 weeks", "Two weeks", "14 days"],
+            "4 weeks": ["4 weeks", "Four weeks", "One month", "30 days"],
+            "Immediately": ["Immediately", "No notice", "0 days", "ASAP"],
+        },
+    },
+
+    # ── Background Check ───────────────────────────────────────────────────────
+    "background_check": {
+        "profile_key": "background_check",
+        "type": "radio",
+        "keywords": ["background check", "background screening"],
+        "aliases": [
+            "willing to undergo background check",
+            "background check authorization",
+            "consent to background check",
+            "background screening consent",
+            "agree to background check",
+        ],
+        "negative_keywords": [],
+        "options_map": {
+            "Yes": ["Yes", "I consent", "I agree", "Agree", "Willing", "Yes, I agree"],
+            "No": ["No", "I do not consent", "I decline"],
+        },
+    },
+
+    # ── Security Clearance ─────────────────────────────────────────────────────
+    "security_clearance": {
+        "profile_key": "security_clearance",
+        "type": "radio",
+        "keywords": ["clearance", "security clearance"],
+        "aliases": [
+            "do you have security clearance",
+            "active clearance",
+            "security clearance status",
+            "do you hold a security clearance",
+            "current clearance level",
+        ],
+        "negative_keywords": [],
+        "options_map": {
+            "No": ["No", "None", "I do not have clearance", "No clearance"],
+            "Yes": ["Yes", "Active", "I hold clearance", "Yes, I have clearance"],
+        },
+    },
+
+    # ── Age Verification ───────────────────────────────────────────────────────
+    "age_verification": {
+        "profile_key": "age_verification",
+        "type": "radio",
+        "keywords": ["age", "18", "legal working age"],
+        "aliases": [
+            "are you at least 18 years of age",
+            "are you 18 or older",
+            "legal working age",
+            "are you of legal working age",
+            "confirm you are 18 or older",
+            "are you at least 18",
+        ],
+        "negative_keywords": [],
+        "options_map": {
+            "Yes": ["Yes", "Yes, I am 18 or older", "I am 18 or older", "Confirmed"],
+            "No": ["No", "No, I am under 18"],
+        },
+    },
+
+    # ── Salary Currency ────────────────────────────────────────────────────────
+    "salary_currency": {
+        "profile_key": "salary_currency",
+        "type": "fill",
+        "keywords": ["currency", "salary currency"],
+        "aliases": [
+            "currency", "salary currency", "preferred currency",
+            "compensation currency",
+        ],
+        "negative_keywords": ["salary", "compensation", "pay"],
+        "options_map": {
+            "USD": ["USD", "US Dollar", "United States Dollar", "$"],
+        },
+    },
+
+    # ── Portfolio URL ──────────────────────────────────────────────────────────
+    "portfolio_url": {
+        "profile_key": "portfolio_url",
+        "type": "fill",
+        "keywords": ["portfolio", "personal website", "work samples"],
+        "aliases": [
+            "portfolio", "personal website", "work samples url",
+            "portfolio url", "personal site", "portfolio link",
+            "personal portfolio", "work portfolio",
+        ],
+        "negative_keywords": ["linkedin", "github", "resume"],
+        "options_map": {},
+    },
+
+    # ── Work Location Preference ───────────────────────────────────────────────
+    "work_location_preference": {
+        "profile_key": "work_location_preference",
+        "type": "radio",
+        "keywords": ["remote", "hybrid", "onsite", "work arrangement"],
+        "aliases": [
+            "remote hybrid onsite preference",
+            "work arrangement",
+            "preferred work arrangement",
+            "work location preference",
+            "do you prefer remote hybrid or onsite",
+            "work from home preference",
+            "office or remote",
+        ],
+        "negative_keywords": [],
+        "options_map": {
+            "Remote": ["Remote", "Fully remote", "Work from home", "Remote only"],
+            "Hybrid": ["Hybrid", "Flexible", "Part remote", "Mix of remote and office"],
+            "Onsite": ["Onsite", "In-office", "On-site", "In office", "Office"],
+        },
+    },
+
+    # ── Country of Citizenship ─────────────────────────────────────────────────
+    "country_of_citizenship": {
+        "profile_key": "country_of_citizenship",
+        "type": "fill",
+        "keywords": ["citizenship", "citizen", "country of citizenship"],
+        "aliases": [
+            "country of citizenship", "citizenship",
+            "are you a citizen of", "current citizenship",
+            "nationality", "country of nationality",
+        ],
+        "negative_keywords": ["residence", "located", "based"],
+        "options_map": {
+            "India": ["India", "Indian"],
+            "United States": ["United States", "US", "USA", "American"],
+        },
+    },
+
+    # ── Highest Education Level ─────────────────────────────────────────────────
+    "highest_education_level": {
+        "profile_key": "education_degree",
+        "type": "radio",
+        "keywords": ["highest education", "education level"],
+        "aliases": [
+            "highest level of education", "education level",
+            "highest education level", "level of education",
+            "highest degree earned", "educational level",
+        ],
+        "negative_keywords": ["school", "university", "field", "major", "year"],
+        "options_map": {
+            "Master of Science": [
+                "Master of Science", "Master's Degree", "Masters", "MS", "M.S.",
+                "Graduate Degree", "Master's",
+            ],
+            "Bachelor of Science": [
+                "Bachelor of Science", "Bachelor's Degree", "Bachelors", "BS", "B.S.",
+                "Bachelor's", "Undergraduate Degree",
+            ],
+        },
+    },
+
+    # ── Has Bachelor's Degree ──────────────────────────────────────────────────
+    "bachelors_degree": {
+        "profile_key": "has_bachelors_degree",
+        "type": "radio",
+        "keywords": ["bachelor", "bachelors", "undergraduate degree"],
+        "aliases": [
+            "do you have a bachelor degree",
+            "do you have a bachelors degree",
+            "bachelor degree",
+            "do you hold a bachelor degree",
+            "have you completed a bachelor",
+        ],
+        "negative_keywords": ["masters", "phd", "doctoral"],
+        "options_map": {
+            "Yes": ["Yes", "Yes, I have a bachelor's degree", "I have a bachelor's degree"],
+            "No": ["No", "No, I do not", "I do not have a bachelor's degree"],
+        },
+    },
 }
 
 
@@ -870,6 +1065,11 @@ def match_field(
     elif pkey == "_cover_letter_path":
         pval = profile.get("_cover_letter_path", "")
 
+    # Derived values: some canonical keys have no direct profile key but can be
+    # inferred from related profile fields.
+    if not pval:
+        pval = _derive_value(best_key, profile)
+
     # Resolve options mapping if field has choices
     if options and pval:
         resolved = _best_option_match(str(pval), options, cdata.get("options_map", {}))
@@ -877,3 +1077,42 @@ def match_field(
             pval = resolved
 
     return (best_key, str(pval), round(best_score, 4))
+
+
+# ---------------------------------------------------------------------------
+# Derived value resolver
+# ---------------------------------------------------------------------------
+
+def _derive_value(canonical_key: str, profile: dict) -> str:
+    """
+    Infer a value for canonical_key from related profile fields when the
+    primary profile_key is absent or empty.
+    """
+    if canonical_key == "highest_education_level":
+        # education_degree is the primary key
+        return profile.get("education_degree", "")
+
+    if canonical_key == "bachelors_degree":
+        # Infer from education_degree or has_bachelors_degree
+        deg = profile.get("education_degree", "").lower()
+        if any(d in deg for d in ["master", "phd", "doctoral", "bachelor"]):
+            return "Yes"
+        return profile.get("has_bachelors_degree", "Yes")  # assume yes for senior profiles
+
+    if canonical_key == "age_verification":
+        # Assume yes for all applicants (default safe answer)
+        return profile.get("age_verification", "Yes")
+
+    if canonical_key == "background_check":
+        return profile.get("background_check", "Yes")
+
+    if canonical_key == "security_clearance":
+        return profile.get("security_clearance", "No")
+
+    if canonical_key in ("work_authorization", "sponsorship"):
+        # Already handled via profile_key, but as fallback:
+        if canonical_key == "work_authorization":
+            return profile.get("work_authorized", "")
+        return profile.get("requires_sponsorship", "")
+
+    return ""

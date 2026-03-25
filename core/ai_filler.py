@@ -3,13 +3,18 @@ from __future__ import annotations
 ai_filler.py – Deterministic + AI-powered form-fill loop (sync Playwright API).
 
 Architecture:
-  1. extract_page_data  – HTML + structured fields + scoped combobox options
-  2. map_fields_deterministically – uses question_map.CATALOG for high-confidence fills
-  3. Phase 1 LLM (once per page) – analyze form HTML -> structured field list
-  4. Phase 2 LLM – generate actions ONLY for unmapped / low-confidence fields
-  5. Merge deterministic + LLM actions and execute
-  6. Check outcome via FormState fingerprint (loop/stuck detection)
-  7. On stuck -> abort with debug artifacts
+  1. extract_fields         – comprehensive FieldMeta via field_extractor
+  2. classify_page          – detect success/login/captcha/fill/review
+  3. map_fields_deterministically – uses question_map.CATALOG
+  4. find_unresolved_required_fields – detect empty required fields
+  5. Phase 1 LLM (once per page) – analyze form HTML -> structured field list
+  6. Phase 2 LLM – generate actions ONLY for unmapped fields
+  7. Validate LLM actions – reject those with bad selectors/options/files
+  8. Merge deterministic + validated LLM actions and execute with interaction.py
+  9. Pre-submit check: if unresolved required fields remain -> DO NOT submit
+  10. Determine step intent from page classifier
+  11. Check state fingerprint for loops (progress-aware)
+  12. Loop or return ApplyResult
 
 Combobox interaction is ALWAYS scoped to each field's listbox to prevent
 cross-dropdown pollution.
@@ -28,6 +33,17 @@ from playwright.sync_api import Page, Frame, TimeoutError as PWTimeout
 from core.question_map import match_field, CATALOG
 from core.form_state import FormState, StateTracker, extract_state
 from core.debug_artifacts import DebugArtifacts
+from core.field_extractor import extract_fields, FieldMeta
+from core.page_classifier import (
+    classify_page, classify_button, find_unresolved_required_fields,
+)
+from core.interaction import (
+    fill_field, select_option, interact_combobox, check_radio,
+    toggle_checkbox, upload_file, InteractionResult,
+)
+from core.outcome import (
+    ApplyResult, FailureType, PageType, StepIntent, make_failure,
+)
 
 MAX_ATTEMPTS = 8
 MAX_HTML_LENGTH = 50_000
@@ -38,7 +54,7 @@ DETERMINISTIC_CONFIDENCE = 0.75
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HTML / field extraction
+# HTML extraction (for LLM prompts)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_clean_html(frame: Frame) -> str:
@@ -83,83 +99,14 @@ def _extract_clean_html(frame: Frame) -> str:
     return raw
 
 
-def _extract_form_fields(frame: Frame) -> list[dict]:
-    """Grab structured field metadata including label, options, aria attributes."""
-    return frame.evaluate(r"""() => {
-        const fields = [];
-        const seen = new Set();
-        const inputs = document.querySelectorAll(
-            'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]),' +
-            'textarea, select, [role="combobox"], [role="textbox"]'
-        );
-        inputs.forEach(el => {
-            const id   = el.id   || '';
-            const name = el.getAttribute('name') || '';
-            const key  = id || name || el.tagName + Math.random();
-            if (seen.has(key)) return;
-            seen.add(key);
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 && rect.height === 0) return;
-
-            // Find label: for attribute, closest wrapper, or aria-label
-            let label = el.getAttribute('aria-label') || '';
-            if (!label && id) {
-                const lEl = document.querySelector('label[for=' + JSON.stringify(id) + ']');
-                if (lEl) label = lEl.innerText.trim();
-            }
-            if (!label) {
-                const wrapper = el.closest('.field-wrapper, .select__container, fieldset, .form-group, [class*="question"], [class*="field-container"]');
-                if (wrapper) {
-                    const l = wrapper.querySelector('label, legend');
-                    if (l) label = l.innerText.trim();
-                }
-            }
-
-            // Labelledby resolution
-            if (!label) {
-                const lblby = el.getAttribute('aria-labelledby') || '';
-                if (lblby) {
-                    const lblEl = document.getElementById(lblby);
-                    if (lblEl) label = lblEl.innerText.trim();
-                }
-            }
-
-            let options = [];
-            if (el.tagName === 'SELECT') {
-                options = Array.from(el.options).map(o => o.text.trim()).filter(Boolean);
-            } else if (el.getAttribute('type') === 'radio') {
-                options = Array.from(document.querySelectorAll('input[name=' + JSON.stringify(name) + ']'))
-                    .map(r => r.value).filter(Boolean);
-            }
-
-            const role = el.getAttribute('role') || '';
-            const required = el.required || el.getAttribute('aria-required') === 'true';
-
-            fields.push({
-                id, name,
-                type: el.getAttribute('type') || el.tagName.toLowerCase(),
-                tag: el.tagName.toLowerCase(),
-                label: label.replace(/\s+/g, ' ').substring(0, 200),
-                placeholder: el.getAttribute('placeholder') || '',
-                required,
-                options,
-                role,
-                value: el.value || '',
-                aria_label: el.getAttribute('aria-label') || '',
-                aria_labelledby: el.getAttribute('aria-labelledby') || '',
-            });
-        });
-        return fields;
-    }""")
-
+# ══════════════════════════════════════════════════════════════════════════════
+# Combobox option extraction (scoped)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_combobox_options(frame: Frame) -> dict[str, list[str]]:
     """
     Click each combobox, read its SCOPED options, close it.
     Returns {combobox_id: [option_texts]}.
-    Cross-pollution is prevented by only reading options from the
-    specific listbox associated with each combobox.
     """
     comboboxes = frame.query_selector_all('[role="combobox"]')
     result: dict[str, list[str]] = {}
@@ -192,6 +139,15 @@ def _extract_combobox_options(frame: Frame) -> dict[str, list[str]]:
                 if parent:
                     option_els = frame.query_selector_all(f'#{parent} [role="option"]')
 
+            # Strategy 4: nearest visible listbox
+            if not option_els:
+                listboxes = frame.query_selector_all('[role="listbox"]')
+                for lb in listboxes:
+                    if lb.is_visible():
+                        option_els = lb.query_selector_all('[role="option"]')
+                        if option_els:
+                            break
+
             for o in option_els[:30]:
                 try:
                     t = o.inner_text().strip()
@@ -221,35 +177,36 @@ def _extract_combobox_options(frame: Frame) -> dict[str, list[str]]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _map_fields_deterministically(
-    fields: list[dict],
+    fields: list[FieldMeta],
     combobox_options: dict[str, list[str]],
     profile: dict,
 ) -> list[dict]:
     """
     Map each extracted field against the CATALOG via question_map.match_field.
 
-    Returns a list of mapping dicts:
+    Returns list of mapping dicts:
     {
-        field: <original field dict>,
+        field: FieldMeta,
         canonical_key: str,
         profile_value: str,
         confidence: float,
         source: "deterministic" | "needs_llm",
-        options: [str],   # merged from field.options + combobox_options
+        options: [str],
     }
     """
     mappings = []
     for f in fields:
         # Merge static options with combobox options (scoped)
-        cb_opts = combobox_options.get(f.get("id", ""), [])
-        all_opts = f.get("options", []) + [o for o in cb_opts if o not in f.get("options", [])]
+        cb_opts = combobox_options.get(f.id, [])
+        static_opts = [o.get("label", "") for o in f.options]
+        all_opts = static_opts + [o for o in cb_opts if o not in static_opts]
 
         ckey, pval, conf = match_field(
-            label=f.get("label", ""),
-            placeholder=f.get("placeholder", ""),
-            name=f.get("name", ""),
-            id=f.get("id", ""),
-            aria_label=f.get("aria_label", ""),
+            label=f.label,
+            placeholder=f.placeholder,
+            name=f.name,
+            id=f.id,
+            aria_label=f.aria_label,
             options=all_opts,
             profile=profile,
         )
@@ -268,8 +225,8 @@ def _map_fields_deterministically(
 
 def _build_deterministic_actions(mappings: list[dict], profile: dict) -> list[dict]:
     """
-    Convert high-confidence deterministic mappings into Playwright actions.
-    Skips mappings with empty profile_value (e.g. github when it's "").
+    Convert high-confidence deterministic mappings into action dicts.
+    Skips mappings with empty profile_value.
     """
     actions = []
     for m in mappings:
@@ -278,50 +235,83 @@ def _build_deterministic_actions(mappings: list[dict], profile: dict) -> list[di
         if not m["profile_value"]:
             continue
 
-        f = m["field"]
+        f: FieldMeta = m["field"]
         pval = m["profile_value"]
-        fid = f.get("id", "")
-        fname = f.get("name", "")
-        selector = f'[id={json.dumps(fid)}]' if fid else f'[name={json.dumps(fname)}]'
-        ftype = f.get("type", "")
-        frole = f.get("role", "")
-        tag = f.get("tag", "")
+        selector = f.selector_candidates[0] if f.selector_candidates else ""
+        if not selector:
+            if f.id:
+                selector = f'#{f.id}'
+            elif f.name:
+                selector = f'[name={json.dumps(f.name)}]'
+            else:
+                continue
+
+        ftype = f.type
+        frole = f.role
+        tag = f.tag
 
         # Upload fields
         if m["canonical_key"] in ("resume_upload", "cover_letter_upload") or ftype == "file":
             if os.path.exists(pval):
-                actions.append({"type": "upload", "selector": selector, "value": pval})
+                actions.append({
+                    "type": "upload",
+                    "selector": selector,
+                    "value": pval,
+                    "selector_candidates": f.selector_candidates,
+                })
             continue
 
         # Radio
         if ftype == "radio":
-            # Build selector targeting the specific radio with matching value
-            # Try value-based selector; if options_map resolved the value, trust it
-            radio_val = pval
-            radio_sel = f'input[name={json.dumps(fname)}][value={json.dumps(radio_val)}]'
-            # Fallback: just the name-based selection — LLM will handle ambiguous ones
-            actions.append({"type": "radio", "selector": radio_sel, "value": pval})
+            actions.append({
+                "type": "radio",
+                "selector": selector,
+                "value": pval,
+                "name": f.name,
+                "options": m["options"],
+                "field_meta": f,
+            })
             continue
 
         # Native select
         if tag == "select":
-            actions.append({"type": "select", "selector": selector, "value": pval})
+            actions.append({
+                "type": "select",
+                "selector": selector,
+                "value": pval,
+                "options": f.options,
+                "selector_candidates": f.selector_candidates,
+            })
             continue
 
         # Combobox (React-Select / custom)
-        if frole == "combobox" or "combobox" in ftype:
-            actions.append({"type": "combobox", "selector": selector, "value": pval})
+        if frole == "combobox" or "combobox" in ftype or f.widget_type in ("react_select", "custom_listbox"):
+            actions.append({
+                "type": "combobox",
+                "selector": selector,
+                "value": pval,
+                "field_meta": f,
+            })
             continue
 
         # Checkbox
         if ftype == "checkbox":
-            # Only check if profile value is affirmative
             if str(pval).lower() in ("yes", "true", "1", "i agree", "agree"):
-                actions.append({"type": "check", "selector": selector})
+                actions.append({
+                    "type": "check",
+                    "selector": selector,
+                    "label": f.label,
+                    "selector_candidates": f.selector_candidates,
+                })
             continue
 
-        # Default: fill (text, email, tel, textarea, etc.)
-        actions.append({"type": "fill", "selector": selector, "value": pval})
+        # Default: fill
+        actions.append({
+            "type": "fill",
+            "selector": selector,
+            "value": pval,
+            "selector_candidates": f.selector_candidates,
+        })
 
     return actions
 
@@ -368,28 +358,15 @@ def _parse_json_array(raw: str) -> list[dict]:
             line for line in text.splitlines()
             if not line.strip().startswith("```")
         )
-    match = re.search(r"\[.*\]", text, re.DOTALL)
-    if match:
-        return json.loads(match.group())
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
+        return json.loads(m.group())
     return json.loads(text)
 
 
-def _detect_step_type(headings: list[str], button_texts: list[str]) -> str:
-    """
-    Heuristic: classify current page as fill | review | success | unknown.
-    """
-    all_text = " ".join(headings + button_texts).lower()
-    if any(w in all_text for w in ["thank you", "application submitted", "successfully submitted", "you've applied"]):
-        return "success"
-    if any(w in all_text for w in ["review", "confirm", "summary"]):
-        return "review"
-    if any(w in all_text for w in ["submit", "next", "continue", "save"]):
-        return "fill"
-    return "unknown"
-
-
-def _build_analysis_prompt(html: str, fields: list[dict],
-                           combobox_options: dict[str, list[str]]) -> str:
+def _build_analysis_prompt(html: str, fields: list[FieldMeta],
+                            combobox_options: dict[str, list[str]]) -> str:
+    fields_data = [f.to_dict() for f in fields]
     return f"""You are analyzing a job application form. Study the HTML and field
 metadata below, then output a STRUCTURED ANALYSIS of every interactive field.
 
@@ -397,7 +374,7 @@ metadata below, then output a STRUCTURED ANALYSIS of every interactive field.
 {html}
 
 ═══ STRUCTURED FIELDS ═══
-{json.dumps(fields, indent=2)}
+{json.dumps(fields_data, indent=2)}
 
 ═══ COMBOBOX OPTIONS (scoped per field id) ═══
 {json.dumps(combobox_options, indent=2)}
@@ -469,12 +446,9 @@ ACTION TYPES:
   check        {{"type":"check",      "selector":"#id_or_css"}}
   radio        {{"type":"radio",      "selector":"input[name='x'][value='y']"}}
   click        {{"type":"click",      "selector":"css selector"}}
-  click_submit {{"type":"click_submit"}}
 
 ═══ CRITICAL RULES ═══
-1. ALWAYS end the array with {{"type":"click_submit"}} for fill/unknown steps.
-   On review steps: use {{"type":"click_submit"}} only after confirming it's a submit.
-   On success steps: return [].
+1. DO NOT include click_submit — navigation is handled separately.
 
 2. GENDER — applicant is MALE.
    Select "Male", "Man", "He/Him", "M" or masculine option.
@@ -507,286 +481,320 @@ ACTION TYPES:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Element targeting and action execution
+# LLM action validation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _resolve_target(frame: Frame, action: dict, timeout: int = 4000):
-    """Find the target element via CSS selector, falling back to id/name attrs."""
-    selector = action.get("selector", "").strip()
-    if selector:
-        try:
-            return frame.wait_for_selector(selector, timeout=timeout)
-        except Exception:
-            pass
-
-    for key in ("id", "name"):
-        value = str(action.get(key, "")).strip()
-        if not value:
-            continue
-        quoted = json.dumps(value)
-        for sel in (f"[id={quoted}]", f"[name={quoted}]"):
-            try:
-                return frame.wait_for_selector(sel, timeout=timeout)
-            except Exception:
-                continue
-
-    raise ValueError(f"Could not locate element for action: {action}")
-
-
-def _interact_combobox(page: Page, frame: Frame, action: dict, value: str) -> None:
+def _validate_llm_actions(
+    frame: Frame,
+    actions: list[dict],
+    fields: list[FieldMeta],
+    combobox_options: dict[str, list[str]],
+) -> tuple[list[dict], list[dict]]:
     """
-    Open a combobox, find its SCOPED options, pick the matching one.
-    Scoping prevents cross-dropdown pollution.
+    Validate LLM-proposed actions before execution.
+
+    Returns (valid_actions, rejected_actions).
+    rejected_actions: [{action, reason}]
     """
-    page.keyboard.press("Escape")
-    time.sleep(0.2)
-    inp = _resolve_target(frame, action)
+    # Build option index: selector -> list of option texts
+    option_index: dict[str, list[str]] = {}
+    for f in fields:
+        key = f.selector_candidates[0] if f.selector_candidates else ""
+        if f.id:
+            key = f"#{f.id}"
+        elif f.name:
+            key = f"[name={json.dumps(f.name)}]"
+        opt_labels = [o.get("label", "") for o in f.options]
+        opt_labels += combobox_options.get(f.id, [])
+        if opt_labels:
+            option_index[key] = opt_labels
 
-    cb_id = inp.get_attribute("id") or ""
-    inp.click()
-    time.sleep(0.8)
+    valid = []
+    rejected = []
 
-    def _scoped_options() -> list:
-        if cb_id:
-            # React-Select pattern
-            opts = frame.query_selector_all(
-                f'#react-select-{cb_id}-listbox [role="option"]'
-            )
-            if opts:
-                return opts
-            # aria-owns / aria-controls
-            owns = inp.get_attribute("aria-owns") or inp.get_attribute("aria-controls") or ""
-            if owns:
-                opts = frame.query_selector_all(f'#{owns} [role="option"]')
-                if opts:
-                    return opts
-        # Fallback: only VISIBLE options (reduced cross-pollution risk)
-        return [o for o in frame.query_selector_all('[role="option"]') if o.is_visible()]
-
-    def _pick(opts, val: str) -> bool:
-        val_lower = val.lower()
-        for opt in opts:
-            try:
-                text = opt.inner_text().strip()
-                if not text:
-                    continue
-                if val_lower == text.lower():
-                    opt.click()
-                    return True
-            except Exception:
-                continue
-        # Partial / substring match
-        for opt in opts:
-            try:
-                text = opt.inner_text().strip()
-                if not text:
-                    continue
-                if val_lower in text.lower() or text.lower() in val_lower:
-                    opt.click()
-                    return True
-            except Exception:
-                continue
-        return False
-
-    # Strategy 1: full list, no typing
-    matched = _pick(_scoped_options(), value)
-
-    # Strategy 2: type to filter, then pick
-    if not matched:
-        try:
-            inp.fill(value)
-            time.sleep(0.8)
-            matched = _pick(_scoped_options(), value)
-        except Exception:
-            pass
-
-    # Strategy 3: first visible option as last-resort fallback
-    if not matched:
-        opts = _scoped_options()
-        if opts:
-            print(f"[ai_filler] combobox {cb_id}: no match for '{value}', picking first option")
-            try:
-                opts[0].click()
-            except Exception:
-                pass
-
-    time.sleep(0.3)
-
-
-def _execute_actions(page: Page, frame: Frame, actions: list[dict]) -> None:
-    """Execute all actions in sequence. Logs each action; never raises."""
     for action in actions:
-        atype = action.get("type")
+        atype = action.get("type", "")
+        selector = action.get("selector", "").strip()
         value = str(action.get("value", ""))
 
+        # click_submit is filtered out from LLM actions; ignore if present
+        if atype in ("click_submit", "click_next", "click_continue", "click_review"):
+            rejected.append({"action": action, "reason": "navigation_action_from_llm_rejected"})
+            continue
+
+        # Validate selector resolves
+        if selector and atype not in ("wait",):
+            try:
+                el = frame.query_selector(selector)
+                if el is None:
+                    rejected.append({"action": action, "reason": f"selector_not_found: {selector}"})
+                    continue
+            except Exception as e:
+                rejected.append({"action": action, "reason": f"selector_error: {e}"})
+                continue
+
+        # Validate upload: file must exist
+        if atype == "upload":
+            if not os.path.exists(value):
+                rejected.append({"action": action, "reason": f"file_not_found: {value}"})
+                continue
+
+        # Validate combobox/select: proposed option must appear in extracted options
+        if atype in ("combobox", "select") and value:
+            # Find the options for this selector
+            opts = option_index.get(selector, [])
+            # Also try partial key matching
+            if not opts:
+                for k, v in option_index.items():
+                    if selector and (selector in k or k in selector):
+                        opts = v
+                        break
+            if opts:
+                from core.interaction import find_best_option_match
+                matched = find_best_option_match(value, opts, threshold=0.7)
+                if matched is None:
+                    rejected.append({
+                        "action": action,
+                        "reason": f"option_not_in_extracted_options: '{value}' not in {opts[:5]}",
+                    })
+                    continue
+
+        # Validate radio: proposed value must match a visible radio label
+        if atype == "radio":
+            # Find the radio group for this selector name
+            name_match = re.search(r'\[name=(["\'])(.*?)\1\]', selector)
+            if name_match:
+                radio_name = name_match.group(2)
+                radio_field = next(
+                    (f for f in fields if f.name == radio_name and f.type == "radio"),
+                    None,
+                )
+                if radio_field:
+                    opt_labels = [o.get("label", "") for o in radio_field.options]
+                    from core.interaction import find_best_option_match
+                    matched = find_best_option_match(value, opt_labels, threshold=0.5)
+                    if matched is None:
+                        # also check option values
+                        opt_values = [o.get("value", "") for o in radio_field.options]
+                        matched = find_best_option_match(value, opt_values, threshold=0.5)
+                        if matched is None:
+                            rejected.append({
+                                "action": action,
+                                "reason": f"radio_value_not_matched: '{value}' not in labels {opt_labels}",
+                            })
+                            continue
+
+        valid.append(action)
+
+    return valid, rejected
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Action execution (using interaction.py primitives)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_actions(
+    page: Page,
+    frame: Frame,
+    actions: list[dict],
+    fields: list[FieldMeta],
+) -> list[dict]:
+    """
+    Execute all actions using interaction.py primitives.
+    Returns list of {action, result: InteractionResult.to_dict()} per action.
+    """
+    executed = []
+    # Build field lookup: selector -> FieldMeta
+    field_by_selector: dict[str, FieldMeta] = {}
+    for f in fields:
+        for s in f.selector_candidates:
+            if s:
+                field_by_selector[s] = f
+        if f.id:
+            field_by_selector[f"#{f.id}"] = f
+        if f.name:
+            field_by_selector[f"[name={json.dumps(f.name)}]"] = f
+
+    for action in actions:
+        atype = action.get("type", "")
+        value = str(action.get("value", ""))
+        selector = action.get("selector", "").strip()
+        selector_candidates = action.get("selector_candidates") or ([selector] if selector else [])
+        field_meta = action.get("field_meta") or field_by_selector.get(selector)
+
+        result_obj = InteractionResult(success=True, actual_value="")
         try:
             if atype == "fill":
-                el = _resolve_target(frame, action)
-                el.click()
-                el.fill(value)
+                result_obj = fill_field(frame, selector_candidates, value)
 
             elif atype == "select":
-                el = _resolve_target(frame, action)
-                try:
-                    el.select_option(label=value)
-                except Exception:
-                    try:
-                        el.select_option(value=value)
-                    except Exception:
-                        # Try partial match on option text
-                        el.evaluate(f"""
-                            el => {{
-                                const val = {json.dumps(value.lower())};
-                                for (const opt of el.options) {{
-                                    if (opt.text.toLowerCase().includes(val) || val.includes(opt.text.toLowerCase())) {{
-                                        el.value = opt.value;
-                                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
-                                        break;
-                                    }}
-                                }}
-                            }}
-                        """)
+                options = action.get("options") or (field_meta.options if field_meta else [])
+                result_obj = select_option(frame, selector_candidates, value, options)
 
             elif atype == "combobox":
-                _interact_combobox(page, frame, action, value)
+                if field_meta:
+                    result_obj = interact_combobox(page, frame, field_meta, value)
+                else:
+                    # Build a minimal FieldMeta for the interaction
+                    import re as _re
+                    id_match = _re.search(r'#([^\s\[]+)', selector)
+                    name_match = _re.search(r'\[name=["\']([^"\']+)["\']', selector)
+                    tmp = FieldMeta(
+                        id=id_match.group(1) if id_match else "",
+                        name=name_match.group(1) if name_match else "",
+                        selector_candidates=selector_candidates,
+                    )
+                    result_obj = interact_combobox(page, frame, tmp, value)
 
             elif atype == "upload":
-                if os.path.exists(value):
-                    el = _resolve_target(frame, action)
-                    el.set_input_files(value)
-                else:
-                    print(f"[ai_filler] upload skipped — file not found: {value}")
+                result_obj = upload_file(frame, selector_candidates, value)
 
             elif atype == "check":
-                el = _resolve_target(frame, action)
-                if not el.is_checked():
-                    el.check()
+                label = action.get("label", field_meta.label if field_meta else "")
+                result_obj = toggle_checkbox(frame, selector_candidates, True, label=label)
 
             elif atype == "radio":
-                el = _resolve_target(frame, action)
-                el.check()
+                if field_meta and field_meta.type == "radio":
+                    result_obj = check_radio(frame, field_meta, value)
+                else:
+                    # Fallback: direct selector check
+                    try:
+                        el = frame.wait_for_selector(selector, timeout=3000)
+                        if el:
+                            el.check()
+                            result_obj = InteractionResult(success=True, actual_value=value)
+                        else:
+                            result_obj = InteractionResult(success=False, error_message=f"radio selector not found: {selector}")
+                    except Exception as e:
+                        result_obj = InteractionResult(success=False, error_message=str(e))
 
             elif atype == "click":
-                el = _resolve_target(frame, action)
-                el.scroll_into_view_if_needed()
-                el.click()
-                time.sleep(0.3)
-
-            elif atype in ("click_submit", "click_next", "click_continue", "click_review"):
-                # Try ordered list of button selectors
-                submit_selectors = [
-                    "button[type='submit']",
-                    "input[type='submit']",
-                    "button:has-text('Submit application')",
-                    "button:has-text('Submit Application')",
-                    "button:has-text('Submit')",
-                    "button:has-text('Next')",
-                    "button:has-text('Continue')",
-                    "button:has-text('Review')",
-                    "a:has-text('Next')",
-                    "a:has-text('Continue')",
-                ]
-                clicked = False
-                for btn_sel in submit_selectors:
-                    try:
-                        btn = frame.wait_for_selector(btn_sel, timeout=3000)
-                        btn.scroll_into_view_if_needed()
-                        time.sleep(0.5)
-                        btn.click()
-                        print(f"[ai_filler] clicked submit: {btn_sel}")
-                        time.sleep(5)
-                        clicked = True
-                        break
-                    except PWTimeout:
-                        continue
-                if not clicked:
-                    print("[ai_filler] click_submit: no button found")
+                try:
+                    el = frame.wait_for_selector(selector, timeout=4000)
+                    if el:
+                        el.scroll_into_view_if_needed()
+                        el.click()
+                        time.sleep(0.3)
+                        result_obj = InteractionResult(success=True)
+                    else:
+                        result_obj = InteractionResult(success=False, error_message=f"click: element not found: {selector}")
+                except Exception as e:
+                    result_obj = InteractionResult(success=False, error_message=str(e))
 
             elif atype == "wait":
-                secs = float(action.get("value", 2))
+                secs = float(value) if value else 2.0
                 time.sleep(min(secs, 10))
+                result_obj = InteractionResult(success=True)
 
         except Exception as exc:
-            print(f"[ai_filler] action {action} -> {exc}")
+            result_obj = InteractionResult(success=False, error_message=str(exc))
+
+        if not result_obj.success:
+            print(f"[ai_filler] action failed: {action} -> {result_obj.error_message}")
+        else:
+            print(f"[ai_filler] action ok: type={atype} sel={selector[:40]} val={value[:30]}")
+
+        executed.append({
+            "action": {k: v for k, v in action.items() if k != "field_meta"},
+            "result": {
+                "success": result_obj.success,
+                "actual_value": result_obj.actual_value,
+                "error_message": result_obj.error_message,
+            },
+        })
+
+    return executed
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Page outcome detection
+# Navigation (step intent execution)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _has_visible_fields(frame: Frame) -> bool:
-    """Return True if the frame still has visible, interactive form fields."""
-    return frame.evaluate(r"""() => {
-        const inputs = document.querySelectorAll(
-            'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=search]),' +
-            'textarea, select, [role="combobox"]'
-        );
-        for (const el of inputs) {
-            const rect = el.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0) return true;
-        }
-        return false;
-    }""")
-
-
-def _detect_outcome(page: Page, frame: Frame) -> tuple[str, list[str]]:
+def _execute_navigation(page: Page, frame: Frame, intent: StepIntent) -> bool:
     """
-    Returns (outcome, errors) where outcome is one of:
-      "success"  – thank-you / application submitted page
-      "errors"   – validation errors on the form
-      "unknown"  – neither
+    Execute the navigation action determined by the page classifier.
+    Returns True if a button was clicked, False otherwise.
     """
-    contents = []
-    seen_urls: set[str] = set()
+    if intent == StepIntent.CLICK_SUBMIT:
+        selectors = [
+            "button:has-text('Submit Application')",
+            "button:has-text('Submit application')",
+            "button:has-text('Submit')",
+            "input[type='submit']",
+            "button[type='submit']",
+            "button:has-text('Finish')",
+            "button:has-text('Apply')",
+        ]
+    elif intent == StepIntent.CLICK_REVIEW:
+        selectors = [
+            "button:has-text('Review Application')",
+            "button:has-text('Review')",
+            "button:has-text('Preview')",
+        ]
+    elif intent in (StepIntent.CLICK_NEXT, StepIntent.CLICK_CONTINUE):
+        selectors = [
+            "button:has-text('Next')",
+            "button:has-text('Continue')",
+            "button:has-text('Proceed')",
+            "a:has-text('Next')",
+            "a:has-text('Continue')",
+            "button[type='submit']",
+            "input[type='submit']",
+        ]
+    else:
+        return False
 
-    for scope in (frame, page.main_frame):
+    for sel in selectors:
         try:
-            scope_url = getattr(scope, "url", "")
-            if scope_url in seen_urls:
-                continue
-            seen_urls.add(scope_url)
-            contents.append(scope.content().lower())
+            btn = frame.wait_for_selector(sel, timeout=3000)
+            if btn and btn.is_visible():
+                btn.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                btn.click()
+                print(f"[ai_filler] navigation: clicked {sel}")
+                time.sleep(3)
+                return True
+        except PWTimeout:
+            continue
         except Exception:
             continue
 
-    current_urls = " ".join(
-        part.lower()
-        for part in [page.url, getattr(frame, "url", "")]
-        if part
-    )
-
-    haystack = "\n".join(contents + [current_urls])
-    if any(w in haystack for w in [
-        "thank you", "application received", "successfully submitted",
-        "we'll be in touch", "application submitted", "you've applied",
-        "your application has been", "thank_you", "submitted successfully",
-    ]):
-        return "success", []
-
-    errors: list[str] = []
-    for scope in (frame, page.main_frame):
+    # Fallback: try on main page
+    for sel in selectors:
         try:
-            error_els = scope.query_selector_all(
-                '[class*="error"]:not([class*="error-boundary"]),'
-                '[class*="invalid"],[aria-invalid="true"],'
-                '.field_with_errors,[class*="validation"]'
-            )
-        except Exception:
+            btn = page.wait_for_selector(sel, timeout=2000)
+            if btn and btn.is_visible():
+                btn.scroll_into_view_if_needed()
+                btn.click()
+                print(f"[ai_filler] navigation (page): clicked {sel}")
+                time.sleep(3)
+                return True
+        except (PWTimeout, Exception):
             continue
 
-        for el in error_els:
-            try:
-                if el.is_visible():
-                    txt = el.inner_text().strip()
-                    if txt and len(txt) < 300:
-                        errors.append(txt)
-            except Exception:
-                pass
+    print(f"[ai_filler] navigation: no button found for intent={intent}")
+    return False
 
-    if errors:
-        return "errors", list(dict.fromkeys(errors))
 
-    return "unknown", []
+# ══════════════════════════════════════════════════════════════════════════════
+# Determine step intent from page context
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_step_intent(page_type: PageType, button_texts: list[str]) -> StepIntent:
+    """Determine what navigation action to take based on page type and buttons."""
+    if page_type == PageType.SUCCESS:
+        return StepIntent.WAIT
+    if page_type == PageType.FINAL_SUBMIT:
+        return StepIntent.CLICK_SUBMIT
+    if page_type == PageType.REVIEW:
+        return StepIntent.CLICK_SUBMIT
+    # For fill pages, look at button texts
+    for btn_text in button_texts:
+        intent = classify_button(btn_text)
+        if intent != StepIntent.CLICK_NEXT:
+            return intent
+        return StepIntent.CLICK_NEXT
+    return StepIntent.CLICK_NEXT
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -799,7 +807,8 @@ def ai_fill_form(
     profile: dict,
     cover_letter: str,
     debug: Optional[DebugArtifacts] = None,
-) -> bool:
+    **kwargs,
+) -> ApplyResult:
     """
     Fill a job application form using deterministic mapping + LLM for edge cases.
 
@@ -810,19 +819,21 @@ def ai_fill_form(
         cover_letter: Cover letter text (will be written to temp file)
         debug:        Optional DebugArtifacts instance for writing artifacts
 
-    Returns True on detected success, False otherwise.
+    Returns ApplyResult (success=True on confirmed submission, failure otherwise).
     """
     if not os.path.exists(CLAUDE_BIN):
-        print(f"[ai_filler] claude CLI not found at {CLAUDE_BIN}")
-        return False
+        msg = f"Claude CLI not found at {CLAUDE_BIN}"
+        print(f"[ai_filler] {msg}")
+        return make_failure(FailureType.MISSING_CLAUDE, reason=msg)
 
     prior_errors: list[str] = []
     tracker = StateTracker()
     all_mappings: list[dict] = []
-    all_actions: list[dict] = []
+    all_executed: list[dict] = []
+    all_rejected: list[dict] = []
 
     # Write cover letter to temp file so it can be uploaded
-    cl_tmp = None
+    cl_tmp: Optional[str] = None
     if cover_letter:
         fd, cl_tmp = tempfile.mkstemp(suffix=".txt", prefix="cover_letter_")
         with os.fdopen(fd, "w") as f:
@@ -842,9 +853,27 @@ def ai_fill_form(
             classification = tracker.record(state)
             print(f"[ai_filler] state fingerprint={state.fingerprint} classification={classification}")
 
+            if debug:
+                debug.record_state_fingerprint(attempt, state.fingerprint)
+
             if classification == "stuck":
+                # Determine stuck type
+                log = tracker.get_log()
+                stuck_type = "stuck_same_page_no_progress"
+                for entry in reversed(log):
+                    if entry.get("classification") == "stuck":
+                        stuck_type = entry.get("stuck_type", stuck_type)
+                        break
+
+                ft_map = {
+                    "stuck_same_page_no_progress": FailureType.STUCK_SAME_PAGE_NO_PROGRESS,
+                    "cycling_between_steps": FailureType.CYCLING_BETWEEN_STEPS,
+                    "repeated_validation_errors": FailureType.REPEATED_VALIDATION_ERRORS,
+                }
+                ft = ft_map.get(stuck_type, FailureType.STUCK_SAME_PAGE_NO_PROGRESS)
+
                 failure_msg = (
-                    f"Stuck on fingerprint {state.fingerprint} "
+                    f"Stuck ({stuck_type}) on fingerprint {state.fingerprint} "
                     f"after {tracker.total_attempts} attempts. "
                     f"Headings: {state.headings[:2]}. "
                     f"Errors: {state.error_texts[:3]}."
@@ -852,26 +881,76 @@ def ai_fill_form(
                 print(f"[ai_filler] STUCK — aborting. {failure_msg}")
                 if debug:
                     debug.record_states(tracker.get_log())
-                    debug.set_failure(failure_msg)
-                return False
+                    debug.record_executed_actions(all_executed)
+                    debug.record_rejected_actions(all_rejected)
+                    debug.set_structured_failure(ft.value, failure_msg)
+                return make_failure(ft, reason=failure_msg, attempts=attempt)
 
             # Take page-load screenshot
             if debug:
                 debug.take_screenshot(page, f"attempt{attempt}_page_load")
 
-            # ── Extract page data ──
+            # ── Classify page ──
+            page_type = classify_page(page, frame)
+            print(f"[ai_filler] page_type={page_type}")
+
+            if debug:
+                debug.record_page_classification(attempt, page_type.value)
+
+            # Success page?
+            if page_type == PageType.SUCCESS:
+                print("[ai_filler] success page detected")
+                if debug:
+                    debug.record_states(tracker.get_log())
+                    debug.record_mappings(all_mappings)
+                    debug.record_executed_actions(all_executed)
+                return ApplyResult(success=True, attempts=attempt)
+
+            # Blocking pages
+            if page_type == PageType.LOGIN_WALL:
+                if debug:
+                    debug.take_screenshot(page, f"attempt{attempt}_login_wall")
+                    debug.record_states(tracker.get_log())
+                return make_failure(
+                    FailureType.LOGIN_REQUIRED,
+                    reason="Login wall detected during form fill",
+                    attempts=attempt,
+                )
+
+            if page_type == PageType.CAPTCHA:
+                if debug:
+                    debug.take_screenshot(page, f"attempt{attempt}_captcha")
+                    debug.record_states(tracker.get_log())
+                return make_failure(
+                    FailureType.CAPTCHA_OR_HUMAN_VERIFICATION,
+                    reason="CAPTCHA detected during form fill",
+                    attempts=attempt,
+                )
+
+            # ── Extract fields ──
+            fields = extract_fields(frame)
             html = _extract_clean_html(frame)
-            fields = _extract_form_fields(frame)
             print(f"[ai_filler] extracted {len(html)} chars HTML, {len(fields)} fields")
 
+            if debug:
+                debug.record_fields([f.to_dict() for f in fields])
+                debug.record_html_snapshot(html, step=attempt)
+
             if not fields and "<form" not in html.lower():
-                # Check if we're already on a success page
-                outcome, _ = _detect_outcome(page, frame)
-                if outcome == "success":
-                    print("[ai_filler] success page detected (no form)")
-                    return True
+                # Recheck page type after HTML analysis
+                if page_type == PageType.SUCCESS:
+                    return ApplyResult(success=True, attempts=attempt)
+                if any(w in html.lower() for w in [
+                    "thank you", "application received", "successfully submitted",
+                    "you've applied", "application submitted",
+                ]):
+                    return ApplyResult(success=True, attempts=attempt)
                 print("[ai_filler] no form content found — giving up")
-                return False
+                return make_failure(
+                    FailureType.UNKNOWN_POST_SUBMIT_STATE,
+                    reason="No form fields found and not on success page",
+                    attempts=attempt,
+                )
 
             # ── Extract combobox options (scoped) ──
             print("[ai_filler] extracting combobox options...")
@@ -886,14 +965,16 @@ def ai_fill_form(
 
             print(f"[ai_filler] mapped deterministically: {len(det_mapped)}, needs LLM: {len(needs_llm)}")
             for m in det_mapped:
-                print(f"  [DET] {m['field'].get('label','?')[:40]:40s} -> {m['canonical_key']:20s} = {str(m['profile_value'])[:30]}")
+                f_label = m["field"].label[:40] if hasattr(m["field"], "label") else str(m["field"])[:40]
+                print(f"  [DET] {f_label:40s} -> {m['canonical_key']:20s} = {str(m['profile_value'])[:30]}")
 
             # Record mappings for debug
             mapping_records = []
             for m in mappings:
+                fld = m["field"]
                 mapping_records.append({
-                    "field_id": m["field"].get("id", ""),
-                    "label": m["field"].get("label", ""),
+                    "field_id": fld.id if hasattr(fld, "id") else "",
+                    "label": fld.label if hasattr(fld, "label") else "",
                     "canonical_key": m["canonical_key"],
                     "profile_value": m["profile_value"],
                     "confidence": m["confidence"],
@@ -901,11 +982,15 @@ def ai_fill_form(
                 })
             all_mappings.extend(mapping_records)
 
+            if debug:
+                debug.record_mappings(mapping_records)
+
             # ── Build deterministic actions ──
             det_actions = _build_deterministic_actions(mappings, profile)
 
             # ── Phase 1 LLM: Analyze the form ──
             print("[ai_filler] PHASE 1: analyzing form...")
+            analysis = "(Phase 1 LLM skipped)"
             try:
                 analysis_prompt = _build_analysis_prompt(html, fields, cb_options)
                 analysis = _call_claude_cli(analysis_prompt)
@@ -915,114 +1000,215 @@ def ai_fill_form(
                 if len(analysis.splitlines()) > 25:
                     print(f"  | ... ({len(analysis.splitlines())} total lines)")
             except Exception as exc:
-                print(f"[ai_filler] Phase 1 error: {exc}")
-                # Degrade gracefully: execute only deterministic actions
-                analysis = "(Phase 1 LLM failed — deterministic only)"
+                print(f"[ai_filler] Phase 1 error: {exc} — continuing with deterministic only")
                 needs_llm = []
 
             # ── Phase 2 LLM: Generate actions for unmapped fields ──
             llm_actions: list[dict] = []
-            step_type = _detect_step_type(state.headings, state.button_texts)
+            step_type_str = page_type.value
 
             if needs_llm or prior_errors:
                 print(f"[ai_filler] PHASE 2: generating LLM actions for {len(needs_llm)} unmapped fields...")
-                unmapped_field_data = [
-                    {
-                        "id": m["field"].get("id", ""),
-                        "name": m["field"].get("name", ""),
-                        "label": m["field"].get("label", ""),
-                        "type": m["field"].get("type", ""),
-                        "placeholder": m["field"].get("placeholder", ""),
+                unmapped_field_data = []
+                for m in needs_llm:
+                    fld = m["field"]
+                    unmapped_field_data.append({
+                        "id": fld.id,
+                        "name": fld.name,
+                        "label": fld.label,
+                        "type": fld.type,
+                        "placeholder": fld.placeholder,
                         "options": m["options"],
-                    }
-                    for m in needs_llm
-                ]
+                        "widget_type": fld.widget_type,
+                    })
 
                 try:
                     action_prompt = _build_action_prompt(
                         analysis, unmapped_field_data, profile,
-                        prior_errors, attempt, step_type
+                        prior_errors, attempt, step_type_str,
                     )
                     raw = _call_claude_cli(action_prompt)
                     llm_actions = _parse_json_array(raw)
                     print(f"[ai_filler] LLM generated {len(llm_actions)} actions")
-                except Exception as exc:
-                    print(f"[ai_filler] Phase 2 error: {exc}")
-                    # Degrade: add a click_submit at minimum
-                    llm_actions = [{"type": "click_submit"}]
-            else:
-                # All fields mapped — just need a submit
-                llm_actions = [{"type": "click_submit"}]
 
-            # ── Merge: deterministic first, then LLM, deduplicate selectors ──
-            # Deterministic actions take priority; LLM actions fill the gaps
-            # but we remove any LLM action whose selector was already handled
+                    if debug:
+                        debug.record_proposed_actions(llm_actions)
+
+                except Exception as exc:
+                    print(f"[ai_filler] Phase 2 error: {exc} — using deterministic actions only")
+                    llm_actions = []
+
+            # ── Validate LLM actions ──
+            valid_llm, rejected_llm = _validate_llm_actions(
+                frame, llm_actions, fields, cb_options,
+            )
+            all_rejected.extend(rejected_llm)
+            if rejected_llm:
+                print(f"[ai_filler] rejected {len(rejected_llm)} LLM actions:")
+                for r in rejected_llm:
+                    print(f"  REJECT: {r['action']} -> {r['reason']}")
+            if debug:
+                debug.record_rejected_actions(all_rejected)
+
+            # ── Merge: deterministic first, then validated LLM ──
             det_selectors = {a.get("selector", "") for a in det_actions if a.get("selector")}
             filtered_llm = []
-            for a in llm_actions:
+            for a in valid_llm:
                 sel = a.get("selector", "")
                 atype = a.get("type", "")
-                if atype == "click_submit":
-                    filtered_llm.append(a)
-                elif sel and sel not in det_selectors:
+                if sel and sel not in det_selectors:
                     filtered_llm.append(a)
                 elif not sel:
                     filtered_llm.append(a)
 
-            # Ensure exactly one click_submit at the end
-            merged = det_actions + [a for a in filtered_llm if a.get("type") != "click_submit"]
-            merged.append({"type": "click_submit"})
+            merged = det_actions + filtered_llm
 
             print(f"[ai_filler] executing {len(merged)} merged actions ({len(det_actions)} det + {len(filtered_llm)} llm)")
             for a in merged:
-                print(f"  > {a.get('type'):12s} {a.get('selector',''):35s} {str(a.get('value',''))[:40]}")
+                print(f"  > {a.get('type'):12s} {str(a.get('selector',''))[:35]} {str(a.get('value',''))[:40]}")
+
+            # Take pre-fill screenshot
+            if debug:
+                debug.take_screenshot(page, f"attempt{attempt}_pre_fill")
+
+            # ── Execute fill actions ──
+            executed = _execute_actions(page, frame, merged, fields)
+            all_executed.extend(executed)
+
+            if debug:
+                debug.record_executed_actions(all_executed)
+
+            # Take post-fill screenshot
+            if debug:
+                debug.take_screenshot(page, f"attempt{attempt}_post_fill")
+
+            # ── Pre-submit check: find unresolved required fields ──
+            unresolved = find_unresolved_required_fields(frame)
+            print(f"[ai_filler] unresolved required fields: {len(unresolved)}")
+            for u in unresolved:
+                print(f"  UNRESOLVED: {u.get('label', '?')} [{u.get('type', '?')}] {u.get('selector', '')}")
+
+            if debug and unresolved:
+                debug.record_unresolved_fields(unresolved)
+
+            if unresolved:
+                # Do NOT submit if required fields are empty
+                print("[ai_filler] BLOCKING SUBMIT: unresolved required fields present")
+                # If we have prior_errors too, we're stuck in validation loop
+                if prior_errors and len(unresolved) == len(prior_errors):
+                    if debug:
+                        debug.record_states(tracker.get_log())
+                    return make_failure(
+                        FailureType.UNRESOLVED_REQUIRED_FIELDS,
+                        reason=f"Cannot fill required fields: {[u.get('label', '?') for u in unresolved]}",
+                        attempts=attempt,
+                        unresolved_fields=unresolved,
+                    )
+                # Record as prior errors and retry
+                prior_errors = [f"Required field '{u.get('label','?')}' is empty" for u in unresolved]
+                continue
+
+            # ── Determine navigation intent ──
+            button_texts = state.button_texts
+            step_intent = _get_step_intent(page_type, button_texts)
+            print(f"[ai_filler] step_intent={step_intent}")
 
             # Take pre-submit screenshot
             if debug:
-                debug.take_screenshot(page, f"attempt{attempt}_before_submit")
+                debug.take_screenshot(page, f"attempt{attempt}_pre_submit")
 
-            all_actions.extend(merged)
-            _execute_actions(page, frame, merged)
+            # ── Execute navigation ──
+            nav_clicked = _execute_navigation(page, frame, step_intent)
 
             # Take post-submit screenshot
             if debug:
-                debug.take_screenshot(page, f"attempt{attempt}_after_submit")
+                debug.take_screenshot(page, f"attempt{attempt}_post_submit")
 
             # ── Check outcome ──
-            outcome, errors = _detect_outcome(page, frame)
-            print(f"[ai_filler] outcome={outcome} errors={errors}")
+            time.sleep(2)
+            post_page_type = classify_page(page, frame)
+            print(f"[ai_filler] post-navigation page_type={post_page_type}")
 
-            if outcome == "success":
+            if post_page_type == PageType.SUCCESS:
                 if debug:
-                    debug.record_fields(fields)
-                    debug.record_mappings(all_mappings)
-                    debug.record_actions(all_actions)
                     debug.record_states(tracker.get_log())
-                return True
+                    debug.record_mappings(all_mappings)
+                    debug.record_executed_actions(all_executed)
+                return ApplyResult(success=True, attempts=attempt)
 
-            if outcome == "errors":
-                prior_errors = errors
+            if post_page_type == PageType.LOGIN_WALL:
+                return make_failure(
+                    FailureType.LOGIN_REQUIRED,
+                    reason="Login wall after navigation",
+                    attempts=attempt,
+                )
+
+            if post_page_type == PageType.CAPTCHA:
+                return make_failure(
+                    FailureType.CAPTCHA_OR_HUMAN_VERIFICATION,
+                    reason="CAPTCHA after navigation",
+                    attempts=attempt,
+                )
+
+            # Check for validation errors
+            error_elements: list[str] = []
+            for scope in (frame, page.main_frame):
+                try:
+                    errs = scope.query_selector_all(
+                        '[class*="error"]:not([class*="error-boundary"]),'
+                        '[class*="invalid"],[aria-invalid="true"],'
+                        '.field_with_errors,[class*="validation"]'
+                    )
+                    for el in errs:
+                        try:
+                            if el.is_visible():
+                                txt = el.inner_text().strip()
+                                if txt and len(txt) < 300:
+                                    error_elements.append(txt)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if error_elements:
+                prior_errors = list(dict.fromkeys(error_elements))
+                print(f"[ai_filler] validation errors: {prior_errors[:3]}")
                 continue
 
-            # Multi-page: check for new fields after submit
-            time.sleep(2)
-            if _has_visible_fields(frame):
-                print("[ai_filler] new page detected — continuing (multi-page form)")
+            # Multi-page: if there are new fields, continue
+            new_fields = extract_fields(frame)
+            if new_fields:
+                print("[ai_filler] new page with fields detected — continuing (multi-page form)")
                 prior_errors = []
                 continue
 
-            print("[ai_filler] submit done, no more visible fields — treating as success")
-            return True
+            # No fields, no success page detected explicitly — treat as success
+            # if we navigated (submitted)
+            if nav_clicked and step_intent == StepIntent.CLICK_SUBMIT:
+                print("[ai_filler] submit clicked, no more fields — treating as success")
+                if debug:
+                    debug.record_states(tracker.get_log())
+                return ApplyResult(success=True, attempts=attempt)
+
+            # No progress
+            print("[ai_filler] no progress detected after navigation — will retry")
+            prior_errors = []
 
         # Exhausted all attempts
         if debug:
-            debug.record_fields([])
-            debug.record_mappings(all_mappings)
-            debug.record_actions(all_actions)
             debug.record_states(tracker.get_log())
-            debug.set_failure(f"Exhausted {MAX_ATTEMPTS} attempts without success")
+            debug.record_mappings(all_mappings)
+            debug.record_executed_actions(all_executed)
+            debug.set_structured_failure(
+                FailureType.STUCK_SAME_PAGE_NO_PROGRESS.value,
+                f"Exhausted {MAX_ATTEMPTS} attempts without success",
+            )
 
-        return False
+        return make_failure(
+            FailureType.STUCK_SAME_PAGE_NO_PROGRESS,
+            reason=f"Exhausted {MAX_ATTEMPTS} attempts without success",
+            attempts=MAX_ATTEMPTS,
+        )
 
     finally:
         if cl_tmp:

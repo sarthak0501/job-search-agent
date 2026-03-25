@@ -507,7 +507,16 @@ class TestCatalog:
             assert "aliases" in data, f"CATALOG[{key!r}] missing 'aliases'"
 
     def test_minimum_catalog_size(self):
-        assert len(CATALOG) >= 20, f"CATALOG only has {len(CATALOG)} entries"
+        assert len(CATALOG) >= 30, f"CATALOG only has {len(CATALOG)} entries"
+
+    def test_new_entries_present(self):
+        new_keys = [
+            "notice_period", "background_check", "security_clearance",
+            "age_verification", "portfolio_url", "work_location_preference",
+            "country_of_citizenship", "highest_education_level", "bachelors_degree",
+        ]
+        for key in new_keys:
+            assert key in CATALOG, f"Missing new catalog entry: {key!r}"
 
 
 # ===========================================================================
@@ -538,3 +547,117 @@ class TestEdgeCases:
         )
         # "Male" profile -> "Man" form option
         assert value in ("Man", "Male", "Prefer not to say")
+
+
+# ===========================================================================
+# New canonical entries (Phase 4)
+# ===========================================================================
+
+class TestNoticePeriod:
+    def test_notice_period_label(self):
+        assert_maps_to("notice_period", label="Notice period required")
+
+    def test_how_much_notice(self):
+        assert_maps_to("notice_period", label="How much notice do you need?")
+
+    def test_notice_period_name(self):
+        key, _, _ = match(name="notice_period")
+        assert key == "notice_period"
+
+
+class TestBackgroundCheck:
+    def test_background_check_label(self):
+        assert_maps_to("background_check", label="Willing to undergo background check")
+
+    def test_background_check_authorization(self):
+        assert_maps_to("background_check", label="Background check authorization")
+
+    def test_background_check_consent(self):
+        key, _, _ = match(label="Consent to background check")
+        assert key == "background_check"
+
+
+class TestAgeVerification:
+    def test_are_you_18(self):
+        key, _, _ = match(label="Are you at least 18 years of age?")
+        assert key == "age_verification"
+
+    def test_legal_working_age(self):
+        key, _, _ = match(label="Are you of legal working age?")
+        assert key in ("age_verification",)
+
+
+class TestExpandedOptionsMap:
+    def test_work_auth_yes_variants(self):
+        """'Y', 'True', 'I am authorized' should all match work_authorization Yes"""
+        for variant in ["Y", "True", "I am authorized", "Authorized"]:
+            _, value, _ = match(
+                label="Are you legally authorized to work in the United States?",
+                options=[variant, "No"],
+            )
+            assert value.lower() in (variant.lower(), "yes"), \
+                f"Expected {variant!r} to match, got {value!r}"
+
+    def test_work_auth_no_variants(self):
+        for variant in ["No", "N", "Not Authorized"]:
+            _, value, _ = match(
+                label="Are you legally authorized to work in the United States?",
+                options=["Yes", variant],
+            )
+            # Profile has work_authorized=Yes, so Yes should be selected
+            assert value.lower() in ("yes", "y", "true", "authorized")
+
+    def test_sponsorship_yes_variants(self):
+        for variant in ["Yes", "Y", "Required"]:
+            _, value, _ = match(
+                label="Will you require sponsorship?",
+                options=[variant, "No"],
+            )
+            # Profile has requires_sponsorship=Yes
+            assert value.lower() in (variant.lower(), "yes")
+
+
+class TestPortfolioURL:
+    def test_portfolio_label(self):
+        # "Portfolio URL" may map to either portfolio_url or website (both are valid)
+        key, _, conf = match(label="Portfolio URL")
+        assert key in ("portfolio_url", "website"), f"Got {key!r}"
+        assert conf >= 0.30
+
+    def test_personal_website(self):
+        key, _, _ = match(label="Personal website")
+        assert key in ("portfolio_url", "website"), f"Got {key!r}"
+
+    def test_work_samples(self):
+        key, _, _ = match(label="Work samples URL")
+        assert key in ("portfolio_url", "website"), f"Got {key!r}"
+
+
+class TestWorkLocationPreference:
+    def test_remote_preference(self):
+        key, _, _ = match(label="Do you prefer remote, hybrid, or onsite?")
+        assert key == "work_location_preference"
+
+    def test_work_arrangement(self):
+        key, _, _ = match(label="Work arrangement preference")
+        assert key == "work_location_preference"
+
+
+class TestHighestEducationLevel:
+    def test_highest_level_of_education(self):
+        key, _, _ = match(label="Highest level of education")
+        assert key in ("education_degree", "highest_education_level")
+
+    def test_education_level(self):
+        key, _, _ = match(label="Education level")
+        assert key in ("education_degree", "highest_education_level")
+
+
+class TestBachelorsDegree:
+    def test_do_you_have_bachelors(self):
+        key, _, _ = match(label="Do you have a bachelor's degree?")
+        assert key == "bachelors_degree"
+
+    def test_bachelor_degree_label(self):
+        key, _, _ = match(label="Bachelor degree")
+        assert key in ("bachelors_degree", "education_degree")

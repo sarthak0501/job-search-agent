@@ -1,5 +1,6 @@
 from __future__ import annotations
 import datetime
+import json
 import pathlib
 from contextlib import asynccontextmanager
 from typing import Generator
@@ -15,6 +16,7 @@ from core.scheduler import start_scheduler, stop_scheduler
 from core.fetcher import fetch_and_store
 from core.applier import apply_to_job, get_apply_readiness
 from core.profile_store import profile_exists, load_profile, save_profile
+from core.outcome import ApplyResult, FailureType
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 BASE_DIR      = pathlib.Path(__file__).resolve().parents[1]
@@ -170,11 +172,6 @@ def health():
     return {"status": "ok", "has_profile": app.state.has_profile}
 
 
-@app.get("/api/apply-readiness")
-def apply_readiness():
-    return get_apply_readiness(check_browser=False)
-
-
 # ── REST API ───────────────────────────────────────────────────────────────────
 @app.get("/api/jobs")
 def list_jobs(status: str | None = None, limit: int = 50,
@@ -239,19 +236,68 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
         try:
             bg_job = bg.get(Job, job_id)
             result = apply_to_job(bg_job)
-            if result.get("success"):
-                bg_job.status = "applied"
-                bg_job.applied_at = datetime.datetime.utcnow()
-                bg_job.last_error = ""
-            elif result.get("failed_permanently"):
-                # Stuck / loop detected — move to failed so it won't be retried
-                bg_job.status = "failed"
-                bg_job.last_error = result.get("error", "Apply loop detected")
-                print(f"[apply] job {job_id} permanently failed: {result.get('error','unknown')}")
+
+            # ApplyResult -> job status mapping
+            if isinstance(result, ApplyResult):
+                if result.success:
+                    bg_job.status = "applied"
+                    bg_job.applied_at = datetime.datetime.utcnow()
+                    bg_job.last_error = ""
+                    print(f"[apply] job {job_id} applied successfully")
+                elif result.failure_type == FailureType.UNRESOLVED_REQUIRED_FIELDS:
+                    # Could not fill required fields — needs human review
+                    bg_job.status = "needs_review"
+                    bg_job.last_error = json.dumps({
+                        "failure_type": result.failure_type.value,
+                        "reason": result.failure_reason,
+                        "unresolved_fields": result.unresolved_fields,
+                        "debug_dir": result.debug_dir,
+                    })
+                    print(f"[apply] job {job_id} needs_review: {result.failure_reason}")
+                elif result.failure_type in (
+                    FailureType.LOGIN_REQUIRED,
+                    FailureType.CAPTCHA_OR_HUMAN_VERIFICATION,
+                    FailureType.HUMAN_VERIFICATION_BLOCKED,
+                    FailureType.AUTH_SESSION_EXPIRED,
+                ):
+                    # Requires manual human action
+                    bg_job.status = "blocked"
+                    bg_job.last_error = json.dumps({
+                        "failure_type": result.failure_type.value,
+                        "reason": result.failure_reason,
+                        "debug_dir": result.debug_dir,
+                    })
+                    print(f"[apply] job {job_id} blocked: {result.failure_reason}")
+                elif result.retryable:
+                    # Transient failure — keep as approved for retry
+                    bg_job.status = "approved"
+                    bg_job.last_error = json.dumps({
+                        "failure_type": result.failure_type.value if result.failure_type else None,
+                        "reason": result.failure_reason,
+                        "debug_dir": result.debug_dir,
+                    })
+                    print(f"[apply] job {job_id} retryable failure: {result.failure_reason}")
+                else:
+                    # Permanent failure
+                    bg_job.status = "failed"
+                    bg_job.last_error = json.dumps({
+                        "failure_type": result.failure_type.value if result.failure_type else None,
+                        "reason": result.failure_reason,
+                        "debug_dir": result.debug_dir,
+                    })
+                    print(f"[apply] job {job_id} failed: {result.failure_reason}")
             else:
-                bg_job.status = "approved"
-                bg_job.last_error = result.get("error", "Unknown apply error")
-                print(f"[apply] job {job_id} failed: {result.get('error','unknown')}")
+                # Legacy dict result fallback
+                if result.get("success"):
+                    bg_job.status = "applied"
+                    bg_job.applied_at = datetime.datetime.utcnow()
+                    bg_job.last_error = ""
+                elif result.get("failed_permanently"):
+                    bg_job.status = "failed"
+                    bg_job.last_error = result.get("error", "Apply loop detected")
+                else:
+                    bg_job.status = "approved"
+                    bg_job.last_error = result.get("error", "Unknown apply error")
             bg.commit()
         except Exception as exc:
             print(f"[apply] job {job_id} exception: {exc}")
@@ -268,6 +314,30 @@ def apply_job(job_id: int, background_tasks: BackgroundTasks,
     background_tasks.add_task(_run, job_id)
     return {"id": job_id, "status": "applying",
             "message": "Browser opened — AI is filling the form"}
+
+
+@app.get("/api/jobs/{job_id}/apply-status")
+def get_apply_status(job_id: int, db: Session = Depends(get_db)):
+    """Return detailed apply status for a job including structured failure info."""
+    job = db.get(Job, job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    d = job.to_dict()
+    # Parse structured last_error if it's JSON
+    if job.last_error:
+        try:
+            d["last_error_detail"] = json.loads(job.last_error)
+        except (json.JSONDecodeError, ValueError):
+            d["last_error_detail"] = {"reason": job.last_error}
+    else:
+        d["last_error_detail"] = None
+    return d
+
+
+@app.get("/api/apply-readiness")
+def apply_readiness():
+    """Return structured readiness breakdown."""
+    return get_apply_readiness(check_browser=False)
 
 
 @app.post("/api/fetch")

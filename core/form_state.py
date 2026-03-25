@@ -4,6 +4,9 @@ form_state.py – Page-state tracking to detect loops during multi-step apply.
 
 Uses a fingerprint (hash of stable page signals) to detect when the applier
 is stuck on the same page state or oscillating between a fixed set of states.
+
+Progress-aware: does not mark stuck if visible field count decreased, page
+classification changed, or URL path changed (indicating real progress was made).
 """
 
 import hashlib
@@ -155,15 +158,57 @@ class StateTracker:
     Records FormState snapshots and detects whether the apply loop is stuck.
 
     record(state) returns one of:
-      "new"      – fingerprint not seen before
-      "repeated" – fingerprint seen before (possible loop)
-      "stuck"    – fingerprint seen STUCK_REPEAT_THRESHOLD+ times OR
-                   total attempts >= STUCK_TOTAL_THRESHOLD
+      "new"                         – fingerprint not seen before
+      "repeated"                    – fingerprint seen before (possible loop)
+      "stuck"                       – fingerprint seen STUCK_REPEAT_THRESHOLD+ times OR
+                                      total attempts >= STUCK_TOTAL_THRESHOLD
+      "stuck_same_page_no_progress" – same fp + same field_count + no URL change
+      "cycling_between_steps"       – oscillating between exactly 2 known fingerprints
+      "repeated_validation_errors"  – same fp with error_texts present repeatedly
+
+    Progress-aware: a "stuck" classification is NOT issued if:
+      - visible field count decreased (form is making progress)
+      - the URL path changed meaningfully
+      - page classification changed (handled by caller via reset())
     """
 
     def __init__(self) -> None:
         self._history: list[dict] = []
         self._fingerprint_counts: dict[str, int] = {}
+
+    @staticmethod
+    def _url_path(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).path
+        except Exception:
+            return url
+
+    def _made_progress(self, state: FormState) -> bool:
+        """
+        Return True if we can observe forward progress vs. the most recent entry.
+        Progress means: fewer visible fields OR URL path changed.
+        """
+        if not self._history:
+            return False
+        prev = self._history[-1]
+        prev_field_count = prev.get("field_count", -1)
+        prev_url_path = self._url_path(prev.get("url", ""))
+        curr_url_path = self._url_path(state.url)
+        field_decreased = state.field_count < prev_field_count and prev_field_count > 0
+        url_changed = curr_url_path != prev_url_path and curr_url_path not in ("", "/")
+        return field_decreased or url_changed
+
+    def _detect_cycling(self, fp: str) -> bool:
+        """Return True if we are oscillating between exactly 2 fingerprints."""
+        if len(self._history) < 4:
+            return False
+        recent = [e["fingerprint"] for e in self._history[-4:]]
+        unique = set(recent)
+        if len(unique) == 2:
+            # All 4 recent entries alternate between 2 fps
+            return recent[0] == recent[2] and recent[1] == recent[3]
+        return False
 
     def record(self, state: FormState) -> str:
         """Record a state snapshot and classify it."""
@@ -185,13 +230,37 @@ class StateTracker:
         }
         self._history.append(entry)
 
-        # Determine classification
-        if total >= STUCK_TOTAL_THRESHOLD:
+        # ── Progress check: never declare stuck if we see measurable forward motion ──
+        made_progress = self._made_progress(state)
+
+        # ── Total threshold ──
+        if total >= STUCK_TOTAL_THRESHOLD and not made_progress:
             entry["classification"] = "stuck"
+            entry["stuck_type"] = "stuck_same_page_no_progress"
             return "stuck"
+
+        # ── Cycling detection ──
+        if self._detect_cycling(fp) and not made_progress:
+            entry["classification"] = "stuck"
+            entry["stuck_type"] = "cycling_between_steps"
+            return "stuck"
+
+        # ── Repeat threshold ──
         if count >= STUCK_REPEAT_THRESHOLD:
+            if made_progress:
+                # Progress detected despite same fingerprint — keep going
+                entry["classification"] = "repeated"
+                return "repeated"
+            # Check sub-type
+            has_errors = bool(state.error_texts)
+            if has_errors and count >= 2:
+                entry["classification"] = "stuck"
+                entry["stuck_type"] = "repeated_validation_errors"
+                return "stuck"
             entry["classification"] = "stuck"
+            entry["stuck_type"] = "stuck_same_page_no_progress"
             return "stuck"
+
         if count > 1:
             entry["classification"] = "repeated"
             return "repeated"
